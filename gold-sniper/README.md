@@ -31,11 +31,21 @@ To backtest, open a new Pine Editor tab, paste `GoldSniper_Strategy.pine`, add i
 
 | Mode | What you get |
 |---|---|
-| **Frequent** (default) | Many signals through the day. All sessions are open and setup rules are looser. If no real level gives the minimum RR, it uses a fixed minimum-RR target. The threshold is tuned for the **most total profit** (R), not the highest win rate. A qualifying signal in the opposite direction closes the open trade (grey "Exit") and flips. |
+| **Frequent** (default) | Many signals through the day. All sessions are open and setup rules are looser. If no real level fits, it uses a fixed minimum-RR target. The threshold is still tuned to your *Target win rate*. Optional: *Flip on opposite signal*. |
 | **Balanced** | Fewer signals. The threshold is tuned to your *Target win rate*. Session toggles apply and nothing flips. |
 | **Sniper** | Only the highest-scoring setups. The threshold never drops below 60. |
 
 More signals means a lower win rate per trade. Compare the dashboard's **Expectancy** and **Profit factor** between modes, not just the win rate.
+
+## Target style (Setups → Target style)
+
+| Style | Targets | Effect |
+|---|---|---|
+| **High win rate** (default) | Nearest real level at ≥ 1:1, placed slightly in front of the level. Stops get 30% more buffer. | Highest hit rate |
+| **Balanced** | ≥ 1:1.5 (1:1.8 on 15m) | Middle ground |
+| **Big RR** | ≥ 1:2 | Wins less often, but wins are bigger |
+
+The adaptive threshold always aims for *Target win rate* (default **70%**). Each time it re-tunes, it picks the lowest score whose last 300 setups met that win rate with positive expectancy.
 
 ## The five setups in plain English
 

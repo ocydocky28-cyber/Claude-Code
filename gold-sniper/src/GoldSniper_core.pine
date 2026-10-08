@@ -46,11 +46,13 @@ strategy("Gold Sniper Strategy [XAUUSD]", "GS Strat", overlay = true, max_boxes_
 
 // ─── INPUTS ──────────────────────────────────────────────────────────────────────
 string G_SET = "Setups"
-string sigMode = input.string("Frequent", "Signal mode", options = ["Frequent", "Balanced", "Sniper"], group = G_SET, tooltip = "Frequent: many signals through the day. All sessions open, looser setup rules, a fixed-RR target when no level fits, the threshold tuned for the most total profit, and a strong opposite signal closes the open trade and flips. Balanced: fewer signals, the threshold tuned for your target win rate. Sniper: only the highest-scoring setups.")
+string sigMode = input.string("Frequent", "Signal mode", options = ["Frequent", "Balanced", "Sniper"], group = G_SET, tooltip = "Frequent: many signals through the day. All sessions open, looser setup rules, and a fixed-RR target when no level fits. Balanced: fewer signals, the threshold tuned for your target win rate. Sniper: only the highest-scoring setups.")
 bool inA = input.bool(true, "A · Liquidity Sweep Reversal", group = G_SET, tooltip = "Price raids an obvious high/low where stop-losses sit, closes back inside with volume, then breaks structure the other way. The main setup, best in London and NY AM.")
 bool inB = input.bool(true, "B · Trend Pullback Continuation", group = G_SET, tooltip = "In a trending market, price pulls back into VWAP, the VWAP 1σ band, a fair-value gap or an order block and rejects it with buying/selling pressure.")
 bool inC = input.bool(true, "C · Compression Breakout", group = G_SET, tooltip = "After 10+ bars of volatility squeeze, price breaks the range with high relative volume and delta in the bias direction.")
 bool inD = input.bool(true, "D · VWAP Band Fade", group = G_SET, tooltip = "Only in a mean-reverting regime: price stretches 2σ+ from VWAP into a key level, shows absorption or delta divergence, and is faded back toward VWAP.")
+string tpStyle = input.string("High win rate", "Target style", options = ["High win rate", "Balanced", "Big RR"], group = G_SET, tooltip = "High win rate: targets about 1:1 (nearest real level at ≥1R), stops given a little more room, TP placed slightly in front of the level. Hits far more often. Balanced: ≥1:1.5 (1:1.8 on 15m). Big RR: ≥1:2, wins less often but bigger.")
+bool flipOn = input.bool(false, "Flip on opposite signal", group = G_SET, tooltip = "Frequent mode only. A qualifying signal the other way closes the open trade early and reverses. Off by default: early exits often close at a small loss and lower the win rate.")
 bool inE = input.bool(true, "E · Trend Flip", group = G_SET, tooltip = "The most frequent setup. An ATR trailing trend (Supertrend) flips direction on a candle closing with the move and with buying/selling pressure behind it, while the higher timeframes aren't strongly against it. Stop behind the last 5-bar swing.")
 string entryModeA = input.string("Market on confirmation", "Sweep entry", options = ["Market on confirmation", "Limit at FVG"], group = G_SET, tooltip = "Market: enter at the close of the bar that confirms the structure shift. Limit: place a limit order at the fair-value gap left by the displacement candle (better price, but some trades won't fill).")
 bool retestC = input.bool(true, "Breakout: wait for retest", group = G_SET, tooltip = "On: place a limit order back at the broken range edge. Off: enter at the close of the breakout candle.")
@@ -80,7 +82,7 @@ int toDate = input.time(timestamp("2099-01-01T00:00:00+00:00"), "Backtest to", g
 
 string G_ML = "Learning engine"
 bool adaptive = input.bool(true, "Adaptive threshold", group = G_ML, tooltip = "Every 20 closed shadow trades, picks the lowest score threshold whose recent win rate meets the target with positive expectancy.")
-float targetWR = input.float(65, "Target win rate %", minval = 40, maxval = 90, group = G_ML, tooltip = "The win rate the adaptive threshold aims for. Higher = fewer, more selective signals.")
+float targetWR = input.float(70, "Target win rate %", minval = 40, maxval = 90, group = G_ML, tooltip = "The win rate the adaptive threshold aims for. Higher = fewer, more selective signals.")
 int thrMin = input.int(40, "Threshold floor", minval = 20, maxval = 90, group = G_ML, tooltip = "The adaptive threshold never goes below this. The score is a calibrated win probability, so for 1.5R+ gold trades most scores sit between 35 and 65; the floor must be low enough for the tuner to find the score level where the measured win rate meets your target.")
 int thrMax = input.int(90, "Threshold ceiling", minval = 50, maxval = 99, group = G_ML, tooltip = "The adaptive threshold never goes above this.")
 float lrIn = input.float(0.02, "Learning rate", minval = 0.001, maxval = 0.2, step = 0.005, group = G_ML, tooltip = "How strongly each closed trade moves the model's weights.")
@@ -134,9 +136,11 @@ bool is15 = tfSec == 900
 bool supportedTF = is1 or is5 or is15
 bool usePreset = autoPreset and supportedTF
 int pivLen = usePreset ? (is1 ? 3 : is5 ? 4 : 5) : mPiv
-float slBuf = usePreset ? (is1 ? 0.3 : is5 ? 0.25 : 0.2) : mBuf
+bool styleHW = tpStyle == "High win rate"
+float slBuf = (usePreset ? (is1 ? 0.3 : is5 ? 0.25 : 0.2) : mBuf) * (styleHW ? 1.3 : 1.0)
 int baseScore = usePreset ? (is1 ? 75 : is5 ? 70 : 68) : mScore
-float minRR = usePreset ? (is15 ? 1.8 : 1.5) : mRR
+float minRR = styleHW ? 1.0 : tpStyle == "Big RR" ? 2.0 : usePreset ? (is15 ? 1.8 : 1.5) : mRR
+float tpFront = styleHW ? 0.12 : 0.05
 bool modeF = sigMode == "Frequent"
 bool modeS = sigMode == "Sniper"
 float dispK = modeF ? 0.9 : 1.2
@@ -950,7 +954,7 @@ f_pickTP(int dir, float entry, float risk, array<float> lv) =>
     float maxDist = na(room) ? 1e10 : room * maxTpRoom / 100
     for L in lv
         if not na(L)
-            float tgt = L - dir * 0.05 * atr14
+            float tgt = L - dir * tpFront * atr14
             float dist = (tgt - entry) * dir
             if dist > 0 and dist / risk >= minRR and dist <= maxDist
                 if na(best) or dist < (best - entry) * dir
@@ -1073,7 +1077,7 @@ f_step(Trade t, bool useBE) =>
             t.slNow := t.entry
     [out, R]
 
-// Learning memory: last 100 closed shadow trades (score, outcome, R) for threshold
+// Learning memory: last 300 closed shadow trades (score, outcome, R) for threshold
 // tuning, per-setup rings of the last 50 qualified results, and setup × session stats.
 var array<float> hScore = array.new<float>()
 var array<float> hY = array.new<float>()
@@ -1125,12 +1129,7 @@ f_retune(float cur) =>
                         sr += array.get(hR, i)
                         if array.get(hY, i) >= 1.0
                             w += 1
-                if c >= 10 and sr > 0 and modeF
-                    // Frequent: the threshold that produced the most total R.
-                    if sr > bestWR
-                        bestWR := sr
-                        fallback := T
-                else if c >= 10 and sr > 0
+                if c >= 10 and sr > 0
                     float wr = w / c * 100
                     if wr >= targetWR
                         res := T
@@ -1228,7 +1227,7 @@ if barstate.isconfirmed
                 array.push(hScore, s.p * 100)
                 array.push(hY, y)
                 array.push(hR, R)
-                if array.size(hScore) > 100
+                if array.size(hScore) > 300
                     array.shift(hScore)
                     array.shift(hY)
                     array.shift(hR)
@@ -1324,7 +1323,7 @@ if barstate.isconfirmed
         int o = o0
         float R = R0
         // Frequent mode: a qualifying opposite signal closes this trade and flips.
-        if modeF and not na(best) and best.dir == -cur.dir and (o == 0 or o == 6)
+        if modeF and flipOn and not na(best) and best.dir == -cur.dir and (o == 0 or o == 6)
             o := cur.filled ? 4 : 5
             R := cur.filled ? (close - cur.entry) * cur.dir / cur.risk : 0.0
         f_extend(cur)
@@ -1480,7 +1479,7 @@ if showDash and barstate.islast
                 shW += 1
     string why = nCandTotal == 0 ? "No setups passed the filters" : closedShadows < warmEff ? "Warming up" : nTr == 0 and topScore < thr ? "Scores below threshold" : "Running"
     f_row(17, "Setups found", str.tostring(nCandTotal) + " · shadow WR " + (hn > 0 ? str.tostring(shW / hn * 100, "#") + "%" : "—"), cW)
-    f_row(18, "Top score (last 100)", na(topScore) ? "—" : str.tostring(math.round(topScore)), cW)
+    f_row(18, "Top score (last 300)", na(topScore) ? "—" : str.tostring(math.round(topScore)), cW)
     f_row(19, "Status", why, why == "Running" ? cBuy : cSell)
 
 // ═══ 13. ALERTS ═════════════════════════════════════════════════════════════════
