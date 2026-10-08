@@ -1,0 +1,1385 @@
+//@version=6
+strategy("Gold Sniper Strategy [XAUUSD]", "Gold Sniper S", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 1000, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, commission_type = strategy.commission.cash_per_contract, commission_value = 0.0, slippage = 2, pyramiding = 0, margin_long = 2, margin_short = 2, process_orders_on_close = false, calc_on_every_tick = false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GOLD SNIPER  ·  XAUUSD / COMEX GC intraday signal engine for 1m · 5m · 15m
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//  HOW THE "LEARNING" WORKS (read this first)
+//  Pine Script keeps no memory between chart reloads. So the script learns ONLINE
+//  across all loaded history: it walks bar by bar from the oldest bar, records
+//  every candidate trade that passes the hard filters ("shadow trades", shown or
+//  not), and only when a shadow trade actually hits its TP, SL or time limit does
+//  it update the model's weights with that result. Nothing ever looks at a future
+//  bar. By the time the script reaches the live bar it has trained on every past
+//  setup on the chart. Reload the chart and it re-trains the same way.
+//
+//  NON-REPAINTING
+//  · Signals, fills and exits are only processed on confirmed (closed) bars.
+//  · Higher-timeframe data uses TradingView's documented non-repainting pattern:
+//    the expression is offset by [1] inside request.security() together with
+//    lookahead_on, so only the last CLOSED higher-timeframe bar is ever used, on
+//    history and in real time alike. lookahead is never used without the [1].
+//
+//  "INSIDER INFO"
+//  No indicator can see private order data, and trading on real insider
+//  information is illegal. This script reads the footprints big players leave on
+//  the chart instead: volume anomalies, volume delta and absorption, raids on
+//  obvious stop-loss clusters (liquidity sweeps), order blocks, fair-value gaps,
+//  and gold's reaction to the US Dollar Index and US 10-year yields.
+//
+//  DRAWING LIMITS
+//  TradingView keeps at most 500 boxes / lines / labels per script and deletes the
+//  oldest automatically, so only the most recent ~120 trades stay drawn. The
+//  dashboard statistics still count every trade since the first loaded bar.
+//
+//  RECOMMENDED CHART LOOK (matches the reference screenshots)
+//  Chart settings → Symbol: bullish body/border/wick #FFFFFF, bearish #5D606B.
+//  Canvas: background #0F0F0F, grid lines off.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────────
+string G_SET = "Setups"
+bool inA = input.bool(true, "A · Liquidity Sweep Reversal", group = G_SET, tooltip = "Price raids an obvious high/low where stop-losses sit, closes back inside with volume, then breaks structure the other way. The main setup, best in London and NY AM.")
+bool inB = input.bool(true, "B · Trend Pullback Continuation", group = G_SET, tooltip = "In a trending market, price pulls back into VWAP, the VWAP 1σ band, a fair-value gap or an order block and rejects it with buying/selling pressure.")
+bool inC = input.bool(true, "C · Compression Breakout", group = G_SET, tooltip = "After 10+ bars of volatility squeeze, price breaks the range with high relative volume and delta in the bias direction.")
+bool inD = input.bool(true, "D · VWAP Band Fade", group = G_SET, tooltip = "Only in a mean-reverting regime: price stretches 2σ+ from VWAP into a key level, shows absorption or delta divergence, and is faded back toward VWAP.")
+string entryModeA = input.string("Market on confirmation", "Sweep entry", options = ["Market on confirmation", "Limit at FVG"], group = G_SET, tooltip = "Market: enter at the close of the bar that confirms the structure shift. Limit: place a limit order at the fair-value gap left by the displacement candle (better price, but some trades won't fill).")
+bool retestC = input.bool(true, "Breakout: wait for retest", group = G_SET, tooltip = "On: place a limit order back at the broken range edge. Off: enter at the close of the breakout candle.")
+int nMSS = input.int(6, "Bars allowed from sweep to structure shift", minval = 1, maxval = 30, group = G_SET, tooltip = "How many bars after a liquidity sweep the structure shift may happen for the sweep setup to stay valid.")
+int limitExpiry = input.int(10, "Limit order expiry (bars)", minval = 1, maxval = 50, group = G_SET, tooltip = "Limit entries not filled within this many bars are cancelled.")
+
+string G_RISK = "Risk & targets"
+bool autoPreset = input.bool(true, "Auto timeframe presets", group = G_RISK, tooltip = "Loads tuned settings for 1m, 5m and 15m automatically (pivot length, stop buffer, starting score, min RR, max trade length). Turn off to use the manual values below.")
+int mPiv = input.int(4, "Manual: swing pivot length", minval = 2, maxval = 10, group = G_RISK, tooltip = "Bars on each side that confirm a swing high/low. Used only when auto presets are off or on other timeframes.")
+float mBuf = input.float(0.25, "Manual: SL buffer (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = G_RISK, tooltip = "Extra room placed beyond the structural stop, as a multiple of ATR(14).")
+int mScore = input.int(70, "Manual: starting min score", minval = 50, maxval = 95, group = G_RISK, tooltip = "Starting signal threshold (estimated win probability × 100). The adaptive engine re-tunes it as results come in.")
+float mRR = input.float(1.5, "Manual: min RR", minval = 1.0, maxval = 5.0, step = 0.1, group = G_RISK, tooltip = "Minimum reward-to-risk a target must offer. Trades without a real level at this RR are skipped.")
+int mMaxBars = input.int(48, "Manual: max trade length (bars)", minval = 5, maxval = 500, group = G_RISK, tooltip = "Trades still open after this many bars are closed at market (grey 'Exit' label).")
+float maxTpRoom = input.float(70, "Max TP distance (% of remaining ADR room)", minval = 10, maxval = 200, group = G_RISK, tooltip = "A target must lie within this % of the room left in today's average daily range. Stops the script aiming for moves gold rarely makes in one day.")
+float maxSpread = input.float(0.35, "Max spread (points)", minval = 0.0, step = 0.05, group = G_RISK, tooltip = "Your broker's typical XAUUSD spread. Signals are skipped when ATR(14) is less than 3× this, because there isn't enough movement to beat the spread.")
+bool useTP1 = input.bool(false, "TP1 at 1R → move SL to breakeven", group = G_RISK, tooltip = "When price reaches 1× the risk, the stop moves to the entry price. A dotted line marks 1R inside the green box.")
+string scratchAs = input.string("Scratch", "Breakeven exit counts as", options = ["Scratch", "Win", "Loss"], group = G_RISK, tooltip = "How a trade that reached TP1 and then came back to breakeven is counted in the dashboard stats. Scratch is the honest default.")
+int cooldownN = input.int(3, "Cooldown bars after a loss", minval = 0, maxval = 50, group = G_RISK, tooltip = "No new signal for this many bars after a losing trade.")
+int maxDayLoss = input.int(3, "Max losses per day", minval = 1, maxval = 20, group = G_RISK, tooltip = "Circuit breaker: after this many losing trades in one gold trading day, no new signals until the next day.")
+bool pdFilter = input.bool(true, "Premium / discount filter", group = G_RISK, tooltip = "Pullback longs only in the lower half of the current swing range (discount), shorts only in the upper half (premium).")
+bool mtfConf = input.bool(true, "MTF confluence on 1m", group = G_RISK, tooltip = "On the 1m chart, only show signals the 5m and 15m structure agrees with. Cuts a lot of 1m noise.")
+float riskPct = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.1, group = G_RISK, tooltip = "Position size is set so that hitting the stop loses this % of equity.")
+int fromDate = input.time(timestamp("UTC", 2020, 1, 1, 0, 0), "Backtest from", group = G_RISK, tooltip = "Start of the backtest window. Use it for walk-forward testing: tune on one period, then check the next period without changing settings.")
+int toDate = input.time(timestamp("UTC", 2099, 1, 1, 0, 0), "Backtest to", group = G_RISK, tooltip = "End of the backtest window.")
+
+string G_ML = "Learning engine"
+bool adaptive = input.bool(true, "Adaptive threshold", group = G_ML, tooltip = "Every 20 closed shadow trades, picks the lowest score threshold whose recent win rate meets the target with positive expectancy.")
+float targetWR = input.float(65, "Target win rate %", minval = 40, maxval = 90, group = G_ML, tooltip = "The win rate the adaptive threshold aims for. Higher = fewer, more selective signals.")
+int thrMin = input.int(60, "Threshold floor", minval = 40, maxval = 90, group = G_ML, tooltip = "The adaptive threshold never goes below this.")
+int thrMax = input.int(90, "Threshold ceiling", minval = 50, maxval = 99, group = G_ML, tooltip = "The adaptive threshold never goes above this.")
+float lrIn = input.float(0.02, "Learning rate", minval = 0.001, maxval = 0.2, step = 0.005, group = G_ML, tooltip = "How strongly each closed trade moves the model's weights.")
+float l2In = input.float(0.001, "L2 regularisation", minval = 0.0, maxval = 0.05, step = 0.001, group = G_ML, tooltip = "Pulls weights gently toward zero so a few lucky trades can't blow the model up.")
+int warmupN = input.int(30, "Warm-up shadow trades", minval = 0, maxval = 500, group = G_ML, tooltip = "No signals are displayed until this many shadow trades have closed and been learned from.")
+
+string G_SES = "Sessions & news (New York time)"
+bool allowAsia = input.bool(false, "Allow Asia signals (19:00–00:00)", group = G_SES, tooltip = "Asia builds the range London and New York usually sweep. Its own moves are slow, so it's off by default.")
+bool allowOther = input.bool(true, "Allow pre-London / pre-NY (00–02, 05–08)", group = G_SES, tooltip = "Transition hours between the main sessions.")
+bool blockDead = input.bool(true, "Block dead zones (11:00–13:30, 16:00–19:00)", group = G_SES, tooltip = "Lunch and post-close hours: thin volume, choppy gold.")
+int nyPmExtra = input.int(5, "NY PM extra score required", minval = 0, maxval = 30, group = G_SES, tooltip = "Afternoon New York is lower quality, so it needs this many extra score points.")
+bool nfpAuto = input.bool(true, "Auto blackout: NFP (1st Friday 08:30)", group = G_SES, tooltip = "No new signals around US Non-Farm Payrolls.")
+int newsBefore = input.int(15, "Blackout minutes before news", minval = 0, maxval = 240, group = G_SES, tooltip = "Minutes before each news time with no new signals.")
+int newsAfter = input.int(30, "Blackout minutes after news", minval = 0, maxval = 240, group = G_SES, tooltip = "Minutes after each news time with no new signals.")
+int news1 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 1", group = G_SES, tooltip = "Pine can't read an economic calendar. Enter high-impact news times here (CPI, FOMC, PCE…). Leave at 2000-01-01 to disable.")
+int news2 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 2", group = G_SES, tooltip = "Second news time. Leave at 2000-01-01 to disable.")
+int news3 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 3", group = G_SES, tooltip = "Third news time. Leave at 2000-01-01 to disable.")
+int news4 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 4", group = G_SES, tooltip = "Fourth news time. Leave at 2000-01-01 to disable.")
+int news5 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 5", group = G_SES, tooltip = "Fifth news time. Leave at 2000-01-01 to disable.")
+
+string G_VOL = "Volume"
+string volSrc = input.string("COMEX:GC1!", "Volume source", options = ["COMEX:GC1!", "Chart"], group = G_VOL, tooltip = "Spot XAUUSD only has broker tick volume. COMEX:GC1! pulls real gold futures volume for relative-volume and absorption, falling back to chart volume on bars where futures data isn't available. VWAP, delta and the volume profile always use chart volume so they stay consistent.")
+int vpRows = input.int(50, "Volume profile rows", minval = 10, maxval = 150, group = G_VOL, tooltip = "Price rows used to build the prior day's volume profile (POC / VAH / VAL).")
+
+string G_VIS = "Visuals"
+color cBuy = input.color(#2ECC71, "Buy label", group = G_VIS)
+color cSell = input.color(#F23645, "Sell label", group = G_VIS)
+color cHit = input.color(#D500F9, "TP hit label", group = G_VIS)
+color cGrey = input.color(#787B86, "SL / exit label", group = G_VIS)
+color cEntry = input.color(#5B6CD8, "Entry line", group = G_VIS)
+color cTPLine = input.color(#2ECC71, "TP line", group = G_VIS)
+color cSLLine = input.color(#F23645, "SL line", group = G_VIS)
+color cTPBox = input.color(color.new(#1B5E20, 60), "TP box", group = G_VIS)
+color cSLBox = input.color(color.new(#7F1D1D, 60), "SL box", group = G_VIS)
+bool showSLHit = input.bool(true, "Show SL / exit labels", group = G_VIS, tooltip = "Grey 'Long SL' / 'Short SL' / 'Exit' labels so losses are visible too.")
+bool showTip = input.bool(true, "Score & RR tooltip on Buy/Sell", group = G_VIS, tooltip = "Hover a Buy/Sell label to see score, RR, setup and session.")
+bool showVwap = input.bool(false, "Show VWAP + σ bands", group = G_VIS)
+bool showLevels = input.bool(false, "Show PDH/PDL + prior POC/VAH/VAL", group = G_VIS)
+bool showAsia = input.bool(false, "Show Asian range box", group = G_VIS)
+bool showDash = input.bool(true, "Show dashboard", group = G_VIS)
+
+// ─── TIMEFRAME PRESETS ───────────────────────────────────────────────────────────
+// Gold behaves differently on each timeframe: 1m needs a wider stop buffer and a
+// stricter score, 15m can aim for bigger RR. These presets load automatically.
+int tfSec = timeframe.in_seconds()
+bool is1 = tfSec == 60
+bool is5 = tfSec == 300
+bool is15 = tfSec == 900
+bool supportedTF = is1 or is5 or is15
+bool usePreset = autoPreset and supportedTF
+int pivLen = usePreset ? (is1 ? 3 : is5 ? 4 : 5) : mPiv
+float slBuf = usePreset ? (is1 ? 0.3 : is5 ? 0.25 : 0.2) : mBuf
+int baseScore = usePreset ? (is1 ? 75 : is5 ? 70 : 68) : mScore
+float minRR = usePreset ? (is15 ? 1.8 : 1.5) : mRR
+int maxBars = usePreset ? (is1 ? 60 : is5 ? 48 : 32) : mMaxBars
+
+// Higher timeframes used for the bias on each chart timeframe.
+string tfA = is1 ? "15" : is5 ? "60" : is15 ? "240" : tfSec < 3600 ? "60" : tfSec < 86400 ? "D" : "W"
+string tfB = is1 ? "60" : is5 ? "240" : is15 ? "D" : tfSec < 3600 ? "240" : tfSec < 86400 ? "W" : "M"
+string tf5 = tfSec <= 300 ? "5" : timeframe.period
+string tf15 = tfSec <= 900 ? "15" : timeframe.period
+string dayTF = tfSec <= 86400 ? "D" : timeframe.period
+string wkTF = tfSec <= 604800 ? "W" : timeframe.period
+string hourTF = tfSec <= 3600 ? "60" : timeframe.period
+string ltf = tfSec > 60 ? "1" : timeframe.period
+
+const int NF = 27
+var array<string> SETUPS = array.from("Sweep Reversal", "Trend Pullback", "Compression Breakout", "VWAP Fade")
+var array<string> SESS = array.from("Asia", "London", "NY AM", "NY PM", "Transition", "Dead zone")
+
+// ─── TYPES ───────────────────────────────────────────────────────────────────────
+// One object per trade. Shadow trades (for learning) and the displayed trade use
+// the same type so they are resolved by exactly the same rules.
+type Trade
+    int dir = 0
+    int setup = 0
+    int sess = 0
+    float entry = na
+    float sl = na
+    float slNow = na
+    float tp = na
+    float risk = na
+    float rr = na
+    float p = na
+    array<float> x
+    bool isLimit = false
+    bool filled = false
+    bool beMoved = false
+    bool qualified = false
+    bool pdSweep = false
+    int sigBar = na
+    int fillBar = na
+    int expiry = na
+    box tpBox = na
+    box slBox = na
+    line tpLn = na
+    line slLn = na
+    line enLn = na
+    line tp1Ln = na
+
+// ─── PURE HELPERS ────────────────────────────────────────────────────────────────
+f_clamp(float v, float lo, float hi) =>
+    na(v) ? 0.0 : math.max(lo, math.min(hi, v))
+
+// Higher-timeframe trend state in [-1, 1]: swing structure (HH/HL vs LH/LL) plus
+// EMA 50/200 alignment and price vs EMA 50. Returns the last CLOSED bar's value.
+f_htfState() =>
+    float e50 = ta.ema(close, 50)
+    float e200 = ta.ema(close, 200)
+    float hp = ta.pivothigh(high, 3, 3)
+    float lp = ta.pivotlow(low, 3, 3)
+    var float h1 = na
+    var float h0 = na
+    var float l1 = na
+    var float l0 = na
+    if not na(hp)
+        h0 := h1
+        h1 := hp
+    if not na(lp)
+        l0 := l1
+        l1 := lp
+    float st = 0.0
+    if h1 > h0 and l1 > l0
+        st := 1.0
+    else if h1 < h0 and l1 < l0
+        st := -1.0
+    float s = 0.5 * st + 0.3 * (e50 > e200 ? 1.0 : -1.0) + 0.2 * (close > e50 ? 1.0 : -1.0)
+    s[1]
+
+// 1H trend of DXY / US10Y: +1 rising, -1 falling (last closed bar).
+f_trend() =>
+    float e20 = ta.ema(close, 20)
+    float e50 = ta.ema(close, 50)
+    float t = e20 > e50 ? 1.0 : -1.0
+    t[1]
+
+// Intrabar delta: buy volume if the intrabar closed up, sell volume if down.
+f_ibDelta() =>
+    close > open ? nz(volume) : close < open ? -nz(volume) : 0.0
+
+// Time-of-day relative volume: this bar's volume vs the average volume of the
+// same time slot over the last `days` sessions (gold at 03:00 ≠ gold at 09:30).
+f_rvol(float v, int slot, int nSlots, int days) =>
+    var array<float> buf = array.new<float>(nSlots * days, na)
+    var array<int> ptr = array.new<int>(nSlots, 0)
+    float sum = 0.0
+    int cnt = 0
+    int base = slot * days
+    for k = 0 to days - 1
+        float x = array.get(buf, base + k)
+        if not na(x)
+            sum += x
+            cnt += 1
+    float avg = cnt >= 3 ? sum / cnt : na
+    if not na(v) and v > 0
+        int p = array.get(ptr, slot)
+        array.set(buf, base + p, v)
+        array.set(ptr, slot, (p + 1) % days)
+    avg > 0 and not na(v) ? v / avg : na
+
+// Rescaled-range statistic for one block of returns (used for the Hurst exponent).
+f_rs(array<float> r, int st, int n) =>
+    float m = 0.0
+    for i = st to st + n - 1
+        m += array.get(r, i)
+    m /= n
+    float cum = 0.0
+    float mx = 0.0
+    float mn = 0.0
+    float ss = 0.0
+    for i = st to st + n - 1
+        float d = array.get(r, i) - m
+        cum += d
+        mx := math.max(mx, cum)
+        mn := math.min(mn, cum)
+        ss += d * d
+    float sdv = math.sqrt(ss / n)
+    sdv > 0 ? (mx - mn) / sdv : na
+
+// Pearson correlation of the returns of two price arrays.
+f_corrRet(array<float> a, array<float> b) =>
+    int n = array.size(a)
+    float r = na
+    if n >= 22
+        array<float> ra = array.new<float>()
+        array<float> rb = array.new<float>()
+        for i = 1 to n - 1
+            float a0 = array.get(a, i - 1)
+            float b0 = array.get(b, i - 1)
+            if a0 > 0 and b0 > 0
+                array.push(ra, array.get(a, i) / a0 - 1)
+                array.push(rb, array.get(b, i) / b0 - 1)
+        int m = array.size(ra)
+        if m >= 20
+            float ma = array.avg(ra)
+            float mb = array.avg(rb)
+            float sab = 0.0
+            float saa = 0.0
+            float sbb = 0.0
+            for i = 0 to m - 1
+                float da = array.get(ra, i) - ma
+                float db = array.get(rb, i) - mb
+                sab += da * db
+                saa += da * da
+                sbb += db * db
+            r := saa > 0 and sbb > 0 ? sab / math.sqrt(saa * sbb) : na
+    r
+
+// Volume profile of one day's bars → [POC, VAH, VAL] with a 70% value area.
+f_profile(array<float> hs, array<float> ls, array<float> vs, int rows) =>
+    float hi = array.max(hs)
+    float lo = array.min(ls)
+    float step = (hi - lo) / rows
+    array<float> bins = array.new<float>(rows, 0.0)
+    if step > 0
+        for i = 0 to array.size(hs) - 1
+            int b0 = math.max(0, math.min(rows - 1, int(math.floor((array.get(ls, i) - lo) / step))))
+            int b1 = math.max(0, math.min(rows - 1, int(math.floor((array.get(hs, i) - lo) / step))))
+            float share = array.get(vs, i) / (b1 - b0 + 1)
+            for b = b0 to b1
+                array.set(bins, b, array.get(bins, b) + share)
+    int pocI = array.indexof(bins, array.max(bins))
+    float total = array.sum(bins)
+    int up = pocI
+    int dn = pocI
+    float acc = array.get(bins, pocI)
+    while acc < total * 0.7 and (up < rows - 1 or dn > 0)
+        float vu = up < rows - 1 ? array.get(bins, up + 1) : -1.0
+        float vd = dn > 0 ? array.get(bins, dn - 1) : -1.0
+        if vu >= vd
+            up += 1
+            acc += vu
+        else
+            dn -= 1
+            acc += vd
+    [lo + (pocI + 0.5) * step, lo + (up + 1) * step, lo + dn * step]
+
+// ═══ 1. SESSIONS & DAILY LEVELS ══════════════════════════════════════════════════
+// Gold's day has a rhythm: Asia builds a range, London often fakes it out, New York
+// AM delivers the real move. Knowing which session we're in decides which setups
+// are worth taking and which highs/lows hold resting stop orders.
+int nyH = hour(time, "America/New_York")
+int nyM = minute(time, "America/New_York")
+int tod = nyH * 60 + nyM
+// 0 Asia · 1 London · 2 NY AM · 3 NY PM · 4 Transition · 5 Dead zone
+int sessId = tod >= 1140 ? 0 : (tod >= 120 and tod < 300) ? 1 : (tod >= 480 and tod < 660) ? 2 : (tod >= 810 and tod < 960) ? 3 : ((tod >= 660 and tod < 810) or (tod >= 960 and tod < 1140)) ? 5 : 4
+
+bool newDay = timeframe.change(dayTF)
+bool newWeek = timeframe.change(wkTF)
+bool newHour = timeframe.change(hourTF)
+
+float atr14 = ta.atr(14)
+float vv = nz(volume) > 0 ? volume : 1.0
+
+// Prior day / week levels: the last CLOSED daily and weekly bars.
+[pdh, pdl, pdc, adrD] = request.security(syminfo.tickerid, dayTF, [high[1], low[1], close[1], ta.sma(high - low, 14)[1]], lookahead = barmerge.lookahead_on)
+[pwh, pwl] = request.security(syminfo.tickerid, wkTF, [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+var float dayHigh = na
+var float dayLow = na
+var float dayOpenMid = na
+if newDay or na(dayHigh)
+    dayHigh := high
+    dayLow := low
+else
+    dayHigh := math.max(dayHigh, high)
+    dayLow := math.min(dayLow, low)
+if nyH == 0 and nz(nyH[1], 0) != 0
+    dayOpenMid := open
+float adrUsed = adrD > 0 ? (dayHigh - dayLow) / adrD : 0.0
+
+// Asian range (19:00–00:00 NY) and London range (02:00–05:00 NY).
+var float asiaH = na
+var float asiaL = na
+var float asiaRunH = na
+var float asiaRunL = na
+var int asiaStartBar = na
+var float lonH = na
+var float lonL = na
+var float lonRunH = na
+var float lonRunL = na
+bool asiaStart = sessId == 0 and nz(sessId[1], -1) != 0
+bool asiaEnd = sessId != 0 and nz(sessId[1], -1) == 0
+bool lonStart = sessId == 1 and nz(sessId[1], -1) != 1
+bool lonEnd = sessId != 1 and nz(sessId[1], -1) == 1
+if asiaStart
+    asiaRunH := high
+    asiaRunL := low
+    asiaStartBar := bar_index
+    asiaH := na
+    asiaL := na
+    lonH := na
+    lonL := na
+else if sessId == 0
+    asiaRunH := math.max(asiaRunH, high)
+    asiaRunL := math.min(asiaRunL, low)
+if asiaEnd
+    asiaH := asiaRunH
+    asiaL := asiaRunL
+    if showAsia and not na(asiaStartBar)
+        box.new(asiaStartBar, asiaH, bar_index - 1, asiaL, border_color = color.new(color.gray, 60), border_width = 1, bgcolor = color.new(color.gray, 92))
+if lonStart
+    lonRunH := high
+    lonRunL := low
+else if sessId == 1
+    lonRunH := math.max(lonRunH, high)
+    lonRunL := math.min(lonRunL, low)
+if lonEnd
+    lonH := lonRunH
+    lonL := lonRunL
+
+// News blackout: manual times + automatic NFP (first Friday, 08:30 NY).
+f_inNews(int t) =>
+    t > timestamp("UTC", 2001, 1, 1, 0, 0) and time_close > t - newsBefore * 60000 and time < t + newsAfter * 60000
+bool nfpNow = nfpAuto and dayofweek(time, "America/New_York") == dayofweek.friday and dayofmonth(time, "America/New_York") <= 7 and tod >= 510 - newsBefore and tod < 510 + newsAfter
+bool blackout = nfpNow or f_inNews(news1) or f_inNews(news2) or f_inNews(news3) or f_inNews(news4) or f_inNews(news5)
+bool sessAllowed = sessId == 0 ? allowAsia : sessId == 4 ? allowOther : sessId == 5 ? not blockDead : true
+
+// ═══ 2. VOLUME & ORDER FLOW ══════════════════════════════════════════════════════
+// VWAP is the price institutions benchmark their fills against; its σ bands show
+// statistically stretched prices. Delta shows who is aggressive (buyers or
+// sellers); relative volume shows when size is in the market.
+
+// Session VWAP (resets with the gold trading day) and volume-weighted σ bands.
+var float sPV = 0.0
+var float sV = 0.0
+var float sPV2 = 0.0
+if newDay
+    sPV := hlc3 * vv
+    sV := vv
+    sPV2 := hlc3 * hlc3 * vv
+else
+    sPV += hlc3 * vv
+    sV += vv
+    sPV2 += hlc3 * hlc3 * vv
+float vw = sV > 0 ? sPV / sV : hlc3
+float sd = sV > 0 ? math.sqrt(math.max(sPV2 / sV - vw * vw, 0.0)) : 0.0
+float zv = sd > 0 ? (close - vw) / sd : 0.0
+
+// Weekly anchored VWAP.
+var float wPV = 0.0
+var float wV = 0.0
+if newWeek
+    wPV := hlc3 * vv
+    wV := vv
+else
+    wPV += hlc3 * vv
+    wV += vv
+float wkVW = wV > 0 ? wPV / wV : na
+
+// Relative volume by time of day, for the chosen source.
+int tfMin = math.max(1, int(math.floor(tfSec / 60)))
+int nSlots = math.max(1, int(math.floor(1440 / tfMin)))
+int slotNow = math.min(nSlots - 1, int(math.floor(tod / tfMin)))
+bool useGC = volSrc == "COMEX:GC1!"
+float gcVol = request.security("COMEX:GC1!", timeframe.period, volume, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+float rvChart = f_rvol(volume, slotNow, nSlots, 20)
+float rvGC = f_rvol(gcVol, slotNow, nSlots, 20)
+bool gcOk = useGC and not na(gcVol) and gcVol > 0 and not na(rvGC)
+float rvol = gcOk ? rvGC : nz(rvChart, 1.0)
+
+// Volume delta from 1-minute intrabars (falls back to a body-weighted estimate).
+array<float> ibArr = request.security_lower_tf(syminfo.tickerid, ltf, f_ibDelta())
+float rng = high - low
+float body = math.abs(close - open)
+float approxDelta = rng > 0 ? vv * (close - open) / rng : 0.0
+float ibDelta = array.size(ibArr) > 1 ? array.sum(ibArr) : approxDelta
+float dAvg = ta.sma(math.abs(ibDelta), 20)
+float deltaN = dAvg > 0 ? f_clamp(ibDelta / dAvg, -1, 1) : 0.0
+
+// Cumulative volume delta per gold day.
+var float cvd = 0.0
+cvd := newDay ? ibDelta : cvd + ibDelta
+
+// Absorption: heavy volume but a small body = big resting orders soaking up the move.
+bool absorb = rvol >= 1.5 and rng > 0 and body < 0.3 * rng
+
+// Delta divergence: new price extreme without a new CVD extreme = exhaustion.
+bool bearDDiv = high >= ta.highest(high, 20) and cvd < ta.highest(cvd, 20)[1]
+bool bullDDiv = low <= ta.lowest(low, 20) and cvd > ta.lowest(cvd, 20)[1]
+bool bearDDivRecent = nz(ta.barssince(bearDDiv), 999) <= 3
+bool bullDDivRecent = nz(ta.barssince(bullDDiv), 999) <= 3
+
+// Prior-day volume profile: POC / VAH / VAL.
+var array<float> vpH = array.new<float>()
+var array<float> vpL = array.new<float>()
+var array<float> vpV = array.new<float>()
+var float pPOC = na
+var float pVAH = na
+var float pVAL = na
+var float vaPos = 0.0
+if newDay and array.size(vpH) > 0
+    [poc, vah, val] = f_profile(vpH, vpL, vpV, vpRows)
+    pPOC := poc
+    pVAH := vah
+    pVAL := val
+    array.clear(vpH)
+    array.clear(vpL)
+    array.clear(vpV)
+    vaPos := open > pVAH ? 1.0 : open < pVAL ? -1.0 : 0.0
+array.push(vpH, high)
+array.push(vpL, low)
+array.push(vpV, vv)
+if array.size(vpH) > 3000
+    array.shift(vpH)
+    array.shift(vpL)
+    array.shift(vpV)
+
+// ═══ 3. SMART MONEY FOOTPRINT ════════════════════════════════════════════════════
+// Stops cluster above obvious highs and below obvious lows. Large players need that
+// liquidity to fill big orders, so a quick raid through a level that closes back
+// inside — followed by a forceful break of structure — is one of the most reliable
+// reversal footprints on gold.
+
+// Swing structure on the chart timeframe.
+float ph = ta.pivothigh(high, pivLen, pivLen)
+float pl = ta.pivotlow(low, pivLen, pivLen)
+var float swH = na
+var float swL = na
+var int trendTF = 0
+if not na(ph)
+    swH := ph
+if not na(pl)
+    swL := pl
+if not na(swH) and close > swH
+    trendTF := 1
+if not na(swL) and close < swL
+    trendTF := -1
+float pdPos = not na(swH) and not na(swL) and swH > swL ? f_clamp((close - swL) / (swH - swL), 0, 1) : 0.5
+
+// Swing-anchored VWAPs from the latest confirmed swing high and low.
+var float avHpv = na
+var float avHv = na
+var float avLpv = na
+var float avLv = na
+if not na(ph)
+    avHpv := 0.0
+    avHv := 0.0
+    for k = 0 to pivLen
+        avHpv += hlc3[k] * vv[k]
+        avHv += vv[k]
+else if not na(avHv)
+    avHpv += hlc3 * vv
+    avHv += vv
+if not na(pl)
+    avLpv := 0.0
+    avLv := 0.0
+    for k = 0 to pivLen
+        avLpv += hlc3[k] * vv[k]
+        avLv += vv[k]
+else if not na(avLv)
+    avLpv += hlc3 * vv
+    avLv += vv
+float avH = avHv > 0 ? avHpv / avHv : na
+float avL = avLv > 0 ? avLpv / avLv : na
+
+// Internal (minor) structure for the market-structure shift.
+float iph = ta.pivothigh(high, 2, 2)
+float ipl = ta.pivotlow(low, 2, 2)
+var float intH = na
+var float intL = na
+var bool intHUsed = false
+var bool intLUsed = false
+if not na(iph)
+    intH := iph
+    intHUsed := false
+if not na(ipl)
+    intL := ipl
+    intLUsed := false
+bool bullBreak = not na(intH) and not intHUsed and close > intH
+bool bearBreak = not na(intL) and not intLUsed and close < intL
+if bullBreak
+    intHUsed := true
+if bearBreak
+    intLUsed := true
+
+// Displacement: one big candle (≥1.2 ATR body) or two strong ones in a row.
+bool strongBull = close > open and body >= 0.6 * atr14
+bool strongBear = close < open and body >= 0.6 * atr14
+bool dispBull = (close > open and body >= 1.2 * atr14) or (strongBull and strongBull[1])
+bool dispBear = (close < open and body >= 1.2 * atr14) or (strongBear and strongBear[1])
+
+// Fair-value gaps (3-candle imbalances > 0.25 ATR), tracked until 50% filled.
+var array<float> bfTop = array.new<float>()
+var array<float> bfBot = array.new<float>()
+var array<float> sfTop = array.new<float>()
+var array<float> sfBot = array.new<float>()
+bool bullFvgTouch = false
+float bullFvgTouchBot = na
+bool bearFvgTouch = false
+float bearFvgTouchTop = na
+if array.size(bfTop) > 0
+    for i = array.size(bfTop) - 1 to 0
+        float t = array.get(bfTop, i)
+        float b = array.get(bfBot, i)
+        if low <= t and close > b
+            bullFvgTouch := true
+            bullFvgTouchBot := na(bullFvgTouchBot) ? b : math.min(bullFvgTouchBot, b)
+        if low <= (t + b) / 2
+            array.remove(bfTop, i)
+            array.remove(bfBot, i)
+if array.size(sfTop) > 0
+    for i = array.size(sfTop) - 1 to 0
+        float t = array.get(sfTop, i)
+        float b = array.get(sfBot, i)
+        if high >= b and close < t
+            bearFvgTouch := true
+            bearFvgTouchTop := na(bearFvgTouchTop) ? t : math.max(bearFvgTouchTop, t)
+        if high >= (t + b) / 2
+            array.remove(sfTop, i)
+            array.remove(sfBot, i)
+bool bullFvgNew = low > high[2] and (low - high[2]) > 0.25 * atr14
+bool bearFvgNew = high < low[2] and (low[2] - high) > 0.25 * atr14
+if bullFvgNew
+    array.push(bfTop, low)
+    array.push(bfBot, high[2])
+    if array.size(bfTop) > 10
+        array.shift(bfTop)
+        array.shift(bfBot)
+if bearFvgNew
+    array.push(sfTop, low[2])
+    array.push(sfBot, high)
+    if array.size(sfTop) > 10
+        array.shift(sfTop)
+        array.shift(sfBot)
+
+// Order blocks: last opposite-colour candle before a displacement that broke structure.
+var float bObT = na
+var float bObB = na
+var float sObT = na
+var float sObB = na
+if bullBreak and dispBull
+    for k = 1 to 10
+        if close[k] < open[k]
+            bObT := high[k]
+            bObB := low[k]
+            break
+if bearBreak and dispBear
+    for k = 1 to 10
+        if close[k] > open[k]
+            sObT := high[k]
+            sObB := low[k]
+            break
+if not na(bObB) and close < bObB
+    bObT := na
+    bObB := na
+if not na(sObT) and close > sObT
+    sObT := na
+    sObB := na
+bool tBullOB = not na(bObT) and low <= bObT and close > bObB
+bool tBearOB = not na(sObB) and high >= sObB and close < sObT
+
+// Liquidity pools: unswept swing highs/lows, flagged when they form equal highs/lows.
+var array<float> poolHi = array.new<float>()
+var array<bool> poolHiEq = array.new<bool>()
+var array<float> poolLo = array.new<float>()
+var array<bool> poolLoEq = array.new<bool>()
+bool sweepHiPool = false
+bool sweepHiEq = false
+bool sweepLoPool = false
+bool sweepLoEq = false
+if array.size(poolHi) > 0
+    for i = array.size(poolHi) - 1 to 0
+        float p = array.get(poolHi, i)
+        if high > p
+            if close < p
+                sweepHiPool := true
+                sweepHiEq := sweepHiEq or array.get(poolHiEq, i)
+            array.remove(poolHi, i)
+            array.remove(poolHiEq, i)
+if array.size(poolLo) > 0
+    for i = array.size(poolLo) - 1 to 0
+        float p = array.get(poolLo, i)
+        if low < p
+            if close > p
+                sweepLoPool := true
+                sweepLoEq := sweepLoEq or array.get(poolLoEq, i)
+            array.remove(poolLo, i)
+            array.remove(poolLoEq, i)
+if not na(ph)
+    bool eq = false
+    if array.size(poolHi) > 0
+        for i = 0 to array.size(poolHi) - 1
+            if math.abs(array.get(poolHi, i) - ph) <= 0.1 * atr14
+                eq := true
+                array.set(poolHiEq, i, true)
+    array.push(poolHi, ph)
+    array.push(poolHiEq, eq)
+    if array.size(poolHi) > 15
+        array.shift(poolHi)
+        array.shift(poolHiEq)
+if not na(pl)
+    bool eq = false
+    if array.size(poolLo) > 0
+        for i = 0 to array.size(poolLo) - 1
+            if math.abs(array.get(poolLo, i) - pl) <= 0.1 * atr14
+                eq := true
+                array.set(poolLoEq, i, true)
+    array.push(poolLo, pl)
+    array.push(poolLoEq, eq)
+    if array.size(poolLo) > 15
+        array.shift(poolLo)
+        array.shift(poolLoEq)
+
+// Sweeps of the key daily levels (level untouched for the previous 20 bars).
+float hhPrev = ta.highest(high, 20)[1]
+float llPrev = ta.lowest(low, 20)[1]
+f_swH(float L) =>
+    not na(L) and high > L and close < L and nz(hhPrev, high) <= L
+f_swL(float L) =>
+    not na(L) and low < L and close > L and nz(llPrev, low) >= L
+bool swPDH = f_swH(pdh) or f_swH(pwh)
+bool swPDL = f_swL(pdl) or f_swL(pwl)
+bool swSesH = f_swH(asiaH) or f_swH(lonH)
+bool swSesL = f_swL(asiaL) or f_swL(lonL)
+bool bearSweep = sweepHiPool or swPDH or swSesH
+bool bullSweep = sweepLoPool or swPDL or swSesL
+
+// RSI divergence on confirmed swing points (confluence only).
+float rsi = ta.rsi(close, 14)
+var float rpH = na
+var float rrH = na
+var float rpL = na
+var float rrL = na
+var int bearRsiBar = na
+var int bullRsiBar = na
+if not na(ph)
+    float rAt = rsi[pivLen]
+    if not na(rpH) and ph > rpH and rAt < rrH
+        bearRsiBar := bar_index
+    rpH := ph
+    rrH := rAt
+if not na(pl)
+    float rAt = rsi[pivLen]
+    if not na(rpL) and pl < rpL and rAt > rrL
+        bullRsiBar := bar_index
+    rpL := pl
+    rrL := rAt
+bool bearRsiDivRecent = not na(bearRsiBar) and bar_index - bearRsiBar <= 10
+bool bullRsiDivRecent = not na(bullRsiBar) and bar_index - bullRsiBar <= 10
+
+// Active sweep state (a sweep needs volume confirmation to count).
+var int swBullBar = na
+var float swBullExt = na
+var bool swBullPD = false
+var int swBearBar = na
+var float swBearExt = na
+var bool swBearPD = false
+bool volBull = rvol >= 1.2 or absorb or bullDDivRecent
+bool volBear = rvol >= 1.2 or absorb or bearDDivRecent
+if bullSweep and volBull
+    swBullBar := bar_index
+    swBullExt := low
+    swBullPD := swPDL
+else if not na(swBullBar)
+    if close < swBullExt or bar_index - swBullBar > nMSS
+        swBullBar := na
+    else
+        swBullExt := math.min(swBullExt, low)
+if bearSweep and volBear
+    swBearBar := bar_index
+    swBearExt := high
+    swBearPD := swPDH
+else if not na(swBearBar)
+    if close > swBearExt or bar_index - swBearBar > nMSS
+        swBearBar := na
+    else
+        swBearExt := math.max(swBearExt, high)
+
+// ═══ 4. QUANT MATHS LAYER ════════════════════════════════════════════════════════
+// Regime decides which playbook works: trends reward pullback entries, mean-reverting
+// markets reward fades back to VWAP, compression precedes breakouts.
+float atrPct = ta.percentrank(atr14, 500)
+float erDen = math.sum(math.abs(close - close[1]), 20)
+float er = erDen > 0 ? math.abs(close - close[20]) / erDen : 0.0
+
+// Hurst exponent by rescaled range over 25/50/100-bar blocks (updated every 5 bars).
+var float hurst = 0.5
+if bar_index > 110 and bar_index % 5 == 0
+    array<float> rets = array.new<float>(100, 0.0)
+    for k = 0 to 99
+        array.set(rets, k, math.log(close[k] / close[k + 1]))
+    float rs100 = f_rs(rets, 0, 100)
+    float rs50 = (nz(f_rs(rets, 0, 50)) + nz(f_rs(rets, 50, 50))) / 2
+    float rs25 = 0.0
+    for b = 0 to 3
+        rs25 += nz(f_rs(rets, b * 25, 25))
+    rs25 /= 4
+    if rs100 > 0 and rs50 > 0 and rs25 > 0
+        float x1 = math.log(25)
+        float x2 = math.log(50)
+        float x3 = math.log(100)
+        float y1 = math.log(rs25)
+        float y2 = math.log(rs50)
+        float y3 = math.log(rs100)
+        float mx = (x1 + x2 + x3) / 3
+        float my = (y1 + y2 + y3) / 3
+        float num = (x1 - mx) * (y1 - my) + (x2 - mx) * (y2 - my) + (x3 - mx) * (y3 - my)
+        float den = (x1 - mx) * (x1 - mx) + (x2 - mx) * (x2 - mx) + (x3 - mx) * (x3 - mx)
+        hurst := den > 0 ? num / den : 0.5
+
+bool trending = er > 0.35 or (hurst > 0.55 and er >= 0.2)
+bool meanRev = not trending and (er < 0.2 or hurst < 0.45)
+float lrSlope = atr14 > 0 ? (ta.linreg(close, 50, 0) - ta.linreg(close, 50, 1)) / atr14 : 0.0
+
+// Bollinger-inside-Keltner squeeze and its range.
+float bbBasis = ta.sma(close, 20)
+float bbDev = 2.0 * ta.stdev(close, 20)
+float kcMid = ta.ema(close, 20)
+float kcRng = 1.5 * ta.atr(20)
+bool sqzOn = bbBasis + bbDev < kcMid + kcRng and bbBasis - bbDev > kcMid - kcRng
+var float sqRunH = na
+var float sqRunL = na
+var int sqRunN = 0
+var float sqLastH = na
+var float sqLastL = na
+var int sqLastN = 0
+var int sqEndBar = na
+var bool sqUsed = false
+// Range used for a breakout on THIS bar = range built by the previous bars.
+float boH = sqzOn[1] ? sqRunH : (not na(sqEndBar) and bar_index - sqEndBar <= 5 ? sqLastH : na)
+float boL = sqzOn[1] ? sqRunL : (not na(sqEndBar) and bar_index - sqEndBar <= 5 ? sqLastL : na)
+int boN = sqzOn[1] ? sqRunN : (not na(sqEndBar) and bar_index - sqEndBar <= 5 ? sqLastN : 0)
+if sqzOn and not sqzOn[1]
+    sqRunH := high
+    sqRunL := low
+    sqRunN := 1
+    sqUsed := false
+else if sqzOn
+    sqRunH := math.max(sqRunH, high)
+    sqRunL := math.min(sqRunL, low)
+    sqRunN += 1
+if not sqzOn and sqzOn[1]
+    sqLastH := sqRunH
+    sqLastL := sqRunL
+    sqLastN := sqRunN
+    sqEndBar := bar_index - 1
+
+// ═══ 5. DAILY BIAS ENGINE ═══════════════════════════════════════════════════════
+// "Where is gold going today?" Combines higher-timeframe structure, where price
+// sits against yesterday's range and today's open, the dollar/yields backdrop, and
+// whether the day opened above, below or inside yesterday's value area.
+float htfA = nz(request.security(syminfo.tickerid, tfA, f_htfState(), lookahead = barmerge.lookahead_on))
+float htfB = nz(request.security(syminfo.tickerid, tfB, f_htfState(), lookahead = barmerge.lookahead_on))
+float st5 = nz(request.security(syminfo.tickerid, tf5, f_htfState(), lookahead = barmerge.lookahead_on))
+float st15 = nz(request.security(syminfo.tickerid, tf15, f_htfState(), lookahead = barmerge.lookahead_on))
+float dxyT = nz(request.security("TVC:DXY", hourTF, f_trend(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true))
+float ylT = nz(request.security("TVC:US10Y", hourTF, f_trend(), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true))
+float dxyC = request.security("TVC:DXY", timeframe.period, close, ignore_invalid_symbol = true)
+
+// Rolling 50-hour gold vs DXY return correlation: the dollar filter only applies
+// when the usual inverse relationship is actually in force (corr < -0.3).
+var array<float> hG = array.new<float>()
+var array<float> hD = array.new<float>()
+var float corrDG = 0.0
+if newHour and not na(dxyC[1]) and not na(close[1])
+    array.push(hG, close[1])
+    array.push(hD, dxyC[1])
+    if array.size(hG) > 51
+        array.shift(hG)
+        array.shift(hD)
+    corrDG := nz(f_corrRet(hG, hD), corrDG)
+float dxyAgree = corrDG < -0.3 ? -(dxyT + ylT) / 2 : 0.0
+
+float pdSide = not na(pdh) and close > pdh ? 1.0 : not na(pdl) and close < pdl ? -1.0 : 0.0
+float openRule = na(dayOpenMid) ? 0.0 : close > dayOpenMid ? 1.0 : -1.0
+float biasScore = 25 * htfA + 25 * htfB + 15 * pdSide + 10 * openRule + 15 * dxyAgree + 10 * vaPos
+int biasSign = biasScore > 20 ? 1 : biasScore < -20 ? -1 : 0
+
+// ═══ 6. SETUP DETECTION ══════════════════════════════════════════════════════════
+bool roomOK = atr14 >= 3 * maxSpread
+bool mtfLong = not (is1 and mtfConf) or st5 + st15 > 0
+bool mtfShort = not (is1 and mtfConf) or st5 + st15 < 0
+bool mtfLongSoft = not (is1 and mtfConf) or st5 + st15 > -0.5
+bool mtfShortSoft = not (is1 and mtfConf) or st5 + st15 < 0.5
+float htfAvg = (htfA + htfB) / 2
+
+// A · Liquidity sweep reversal: sweep (with volume) → displacement break of structure.
+bool aLong = inA and not na(swBullBar) and bullBreak and dispBull and mtfLongSoft
+bool aShort = inA and not na(swBearBar) and bearBreak and dispBear and mtfShortSoft
+
+// B · Trend pullback: trend regime, HTF + chart structure agree, rejection at value.
+bool tLongVW = low <= vw + 0.1 * atr14 and close > vw
+bool tLongB1 = sd > 0 and low <= vw - sd and close > vw - sd
+bool tShortVW = high >= vw - 0.1 * atr14 and close < vw
+bool tShortB1 = sd > 0 and high >= vw + sd and close < vw + sd
+bool rejBull = close > open and rng > 0 and (close - low) >= 0.6 * rng and deltaN > 0
+bool rejBear = close < open and rng > 0 and (high - close) >= 0.6 * rng and deltaN < 0
+bool bLong = inB and trending and trendTF == 1 and htfAvg > 0.2 and (tLongVW or tLongB1 or tBullOB or bullFvgTouch) and rejBull and (not pdFilter or pdPos <= 0.5) and adrUsed < 0.85 and mtfLong
+bool bShort = inB and trending and trendTF == -1 and htfAvg < -0.2 and (tShortVW or tShortB1 or tBearOB or bearFvgTouch) and rejBear and (not pdFilter or pdPos >= 0.5) and adrUsed < 0.85 and mtfShort
+float bLongZone = tBullOB ? bObB : bullFvgTouch ? bullFvgTouchBot : tLongB1 ? vw - sd : vw
+float bShortZone = tBearOB ? sObT : bearFvgTouch ? bearFvgTouchTop : tShortB1 ? vw + sd : vw
+
+// C · Compression breakout: 10+ squeeze bars, quiet ATR, then volume + delta break.
+bool cBase = inC and not sqUsed and boN >= 10 and nz(atrPct[1], 100) < 30 and rvol >= 1.8 and adrUsed < 0.85
+bool cLong = cBase and close > boH and close[1] <= boH and deltaN > 0 and biasSign == 1 and mtfLong
+bool cShort = cBase and close < boL and close[1] >= boL and deltaN < 0 and biasSign == -1 and mtfShort
+
+// D · VWAP band fade: mean-reverting regime, 2σ stretch into a key level + exhaustion.
+f_near(float price, array<float> lv, float tol) =>
+    bool hit = false
+    for L in lv
+        if not na(L) and math.abs(price - L) <= tol
+            hit := true
+    hit
+bool dLong = false
+bool dShort = false
+if inD and meanRev and sd > 0.3 * atr14
+    if high >= vw + 2 * sd and close < vw + 2 * sd and (absorb or bearDDivRecent)
+        array<float> keyHi = array.from(pdh, pwh, asiaH, lonH, pVAH, pPOC)
+        array.concat(keyHi, poolHi)
+        dShort := (f_near(high, keyHi, 0.35 * atr14) or bearSweep) and mtfShortSoft
+    if low <= vw - 2 * sd and close > vw - 2 * sd and (absorb or bullDDivRecent)
+        array<float> keyLo = array.from(pdl, pwl, asiaL, lonL, pVAL, pPOC)
+        array.concat(keyLo, poolLo)
+        dLong := (f_near(low, keyLo, 0.35 * atr14) or bullSweep) and mtfLongSoft
+
+bool sweepInLong = not na(swBullBar) or bullSweep
+bool sweepInShort = not na(swBearBar) or bearSweep
+
+// ═══ 7. STOP LOSS / TAKE PROFIT ═════════════════════════════════════════════════
+// Stops go behind structure; targets go to the next REAL level (liquidity, VWAP
+// bands, prior value area, daily extremes, opposing gaps). If no real level offers
+// the minimum RR inside today's remaining range, the trade is skipped. Only taking
+// trades where a realistic target sits at a good RR is what keeps the hit rate up.
+f_levels() =>
+    array<float> lv = array.from(pdh, pdl, pwh, pwl, asiaH, asiaL, lonH, lonL, vw, vw + sd, vw - sd, vw + 2 * sd, vw - 2 * sd, pPOC, pVAH, pVAL, wkVW, avH, avL, dayHigh, dayLow)
+    array.concat(lv, poolHi)
+    array.concat(lv, poolLo)
+    array.concat(lv, sfBot)
+    array.concat(lv, bfTop)
+    lv
+
+f_pickTP(int dir, float entry, float risk, array<float> lv) =>
+    float best = na
+    float room = na(adrD) ? na : dir == 1 ? math.max(dayLow + adrD - entry, 0.0) : math.max(entry - (dayHigh - adrD), 0.0)
+    float maxDist = na(room) ? 1e10 : room * maxTpRoom / 100
+    for L in lv
+        if not na(L)
+            float tgt = L - dir * 0.05 * atr14
+            float dist = (tgt - entry) * dir
+            if dist > 0 and dist / risk >= minRR and dist <= maxDist
+                if na(best) or dist < (best - entry) * dir
+                    best := tgt
+    best
+
+// Stop clamped to [0.5, 2.5] × ATR: too tight → widened, too wide → trade skipped.
+f_finalSL(int dir, float entry, float rawSL) =>
+    float sl = rawSL
+    if not na(rawSL) and (entry - rawSL) * dir < 0.5 * atr14
+        sl := entry - dir * 0.5 * atr14
+    na(sl) or (entry - sl) * dir > 2.5 * atr14 ? na : sl
+
+// ═══ 8. SELF-LEARNING ENGINE ════════════════════════════════════════════════════
+// Online logistic regression: score = sigmoid(w·x + b) = estimated probability the
+// trade hits TP before SL. After each shadow trade closes: w += lr·((y − p)·x − l2·w).
+//
+// Feature index map (all scaled to 0..1 or -1..1, signed so + favours the trade):
+//  0 daily bias alignment      9 efficiency ratio          18 setup A (sweep)
+//  1 HTF structure agreement  10 Hurst (centred)           19 setup B (pullback)
+//  2 relative volume          11 ATR percentile            20 setup C (breakout)
+//  3 delta agreement          12 session London            21 setup D (fade)
+//  4 absorption               13 session NY AM             22 RR available
+//  5 liquidity sweep present  14 session NY PM             23 TP distance (% ADR)
+//  6 displacement strength    15 session Asia              24 RSI divergence
+//  7 FVG / order block        16 premium/discount position 25 delta divergence
+//  8 VWAP z-score (toward)    17 DXY / yields agreement    26 regression slope
+//  27 = bias term
+// Starting weights are hand-tuned priors (sweep, bias and HTF heaviest; higher RR
+// and farther targets lower the probability) so it works from the first bar.
+var array<float> W = array.from(0.9, 0.6, 0.3, 0.4, 0.25, 0.7, 0.4, 0.3, 0.2, 0.15, 0.1, -0.2, 0.15, 0.3, -0.15, -0.3, 0.35, 0.3, 0.35, 0.15, 0.0, 0.1, -0.6, -0.5, 0.2, 0.3, 0.25, -0.9)
+
+f_prob(array<float> x) =>
+    float z = array.get(W, NF)
+    for i = 0 to NF - 1
+        z += array.get(W, i) * array.get(x, i)
+    na(z) ? 0.5 : 1.0 / (1.0 + math.exp(-z))
+
+f_learn(array<float> x, float y) =>
+    float g = y - f_prob(x)
+    for i = 0 to NF - 1
+        float w = array.get(W, i)
+        array.set(W, i, w + lrIn * (g * array.get(x, i) - l2In * w))
+    array.set(W, NF, array.get(W, NF) + lrIn * g)
+
+f_feats(int dir, int setup, float rr, float tpDist, bool sweepIn, float dispS, bool fvgOb) =>
+    array<float> x = array.new<float>(NF, 0.0)
+    array.set(x, 0, f_clamp(biasScore / 100 * dir, -1, 1))
+    array.set(x, 1, f_clamp(htfAvg * dir, -1, 1))
+    array.set(x, 2, f_clamp((rvol - 1) / 2, -1, 1))
+    array.set(x, 3, f_clamp(deltaN * dir, -1, 1))
+    array.set(x, 4, absorb ? 1.0 : 0.0)
+    array.set(x, 5, sweepIn ? 1.0 : 0.0)
+    array.set(x, 6, f_clamp(dispS / 2, 0, 1))
+    array.set(x, 7, fvgOb ? 1.0 : 0.0)
+    array.set(x, 8, f_clamp(-zv * dir / 3, -1, 1))
+    array.set(x, 9, f_clamp(er, 0, 1))
+    array.set(x, 10, f_clamp((hurst - 0.5) * 4, -1, 1))
+    array.set(x, 11, f_clamp(atrPct / 100, 0, 1))
+    array.set(x, 12, sessId == 1 ? 1.0 : 0.0)
+    array.set(x, 13, sessId == 2 ? 1.0 : 0.0)
+    array.set(x, 14, sessId == 3 ? 1.0 : 0.0)
+    array.set(x, 15, sessId == 0 ? 1.0 : 0.0)
+    array.set(x, 16, f_clamp((0.5 - pdPos) * 2 * dir, -1, 1))
+    array.set(x, 17, f_clamp(dxyAgree * dir, -1, 1))
+    array.set(x, 18 + setup, 1.0)
+    array.set(x, 22, f_clamp((rr - 1) / 3, 0, 1))
+    array.set(x, 23, adrD > 0 ? f_clamp(tpDist / adrD, 0, 1) : 0.0)
+    array.set(x, 24, (dir == 1 ? bullRsiDivRecent : bearRsiDivRecent) ? 1.0 : 0.0)
+    array.set(x, 25, (dir == 1 ? bullDDivRecent : bearDDivRecent) ? 1.0 : 0.0)
+    array.set(x, 26, f_clamp(lrSlope * 20 * dir, -1, 1))
+    x
+
+// Builds a candidate trade (or na if no valid stop / target exists).
+f_cand(int dir, int setup, float entry, float rawSL, array<float> lv, bool isLimit, bool sweepIn, bool fvgOb, bool pdSw) =>
+    Trade t = na
+    float sl = f_finalSL(dir, entry, rawSL)
+    if not na(sl) and not na(entry)
+        float risk = (entry - sl) * dir
+        float tp = f_pickTP(dir, entry, risk, lv)
+        if not na(tp)
+            float rr = (tp - entry) * dir / risk
+            array<float> x = f_feats(dir, setup, rr, math.abs(tp - entry), sweepIn, atr14 > 0 ? body / atr14 : 0.0, fvgOb)
+            t := Trade.new(dir = dir, setup = setup, sess = sessId, entry = entry, sl = sl, slNow = sl, tp = tp, risk = risk, rr = rr, p = f_prob(x), x = x, isLimit = isLimit, filled = not isLimit, pdSweep = pdSw, sigBar = bar_index, fillBar = isLimit ? na : bar_index, expiry = bar_index + limitExpiry)
+    t
+
+// Advances one trade by one bar. Returns [outcome, R]:
+// 0 open · 1 TP · 2 SL · 3 breakeven · 4 timeout · 5 cancelled · 6 limit just filled.
+// If TP and SL are both inside the same bar, the stop is assumed hit first.
+f_step(Trade t, bool useBE) =>
+    int out = 0
+    float R = 0.0
+    if not t.filled
+        if bar_index > t.expiry
+            out := 5
+        else if (t.dir == 1 and low <= t.entry) or (t.dir == -1 and high >= t.entry)
+            t.filled := true
+            t.fillBar := bar_index
+            out := 6
+            if (t.dir == 1 and low <= t.sl) or (t.dir == -1 and high >= t.sl)
+                out := 2
+                R := -1.0
+    else
+        bool hitSL = t.dir == 1 ? low <= t.slNow : high >= t.slNow
+        bool hitTP = t.dir == 1 ? high >= t.tp : low <= t.tp
+        if hitSL
+            out := t.beMoved ? 3 : 2
+            R := t.beMoved ? 0.0 : -1.0
+        else if hitTP
+            out := 1
+            R := t.rr
+        else if bar_index - t.fillBar >= maxBars
+            out := 4
+            R := (close - t.entry) * t.dir / t.risk
+        else if useBE and not t.beMoved and (t.dir == 1 ? high >= t.entry + t.risk : low <= t.entry - t.risk)
+            t.beMoved := true
+            t.slNow := t.entry
+    [out, R]
+
+// Learning memory: last 100 closed shadow trades (score, outcome, R) for threshold
+// tuning, per-setup rings of the last 50 qualified results, and setup × session stats.
+var array<float> hScore = array.new<float>()
+var array<float> hY = array.new<float>()
+var array<float> hR = array.new<float>()
+var matrix<float> ringR = matrix.new<float>(4, 50, na)
+var array<int> ringPtr = array.new<int>(4, 0)
+var array<int> ringCnt = array.new<int>(4, 0)
+var array<bool> setupOff = array.new<bool>(4, false)
+var matrix<float> comboR = matrix.new<float>(4, 6, 0.0)
+var matrix<float> comboN = matrix.new<float>(4, 6, 0.0)
+
+f_ringExp(int s, int n) =>
+    int c = math.min(array.get(ringCnt, s), n)
+    float sum = 0.0
+    int p = array.get(ringPtr, s)
+    if c > 0
+        for k = 1 to c
+            sum += matrix.get(ringR, s, (p - k + 50) % 50)
+    c > 0 ? sum / c : na
+
+f_ringPush(int s, float R) =>
+    int p = array.get(ringPtr, s)
+    matrix.set(ringR, s, p, R)
+    array.set(ringPtr, s, (p + 1) % 50)
+    array.set(ringCnt, s, math.min(array.get(ringCnt, s) + 1, 50))
+    // A setup with negative expectancy over its last 30 qualified trades is switched
+    // off for display until its shadow results recover.
+    float e = f_ringExp(s, 30)
+    array.set(setupOff, s, array.get(ringCnt, s) >= 15 and e < 0)
+
+// Lowest threshold whose recent shadow win rate ≥ target with positive expectancy.
+// If none qualifies, the threshold with the best win rate and positive expectancy.
+f_retune(float cur) =>
+    float res = cur
+    float bestWR = -1.0
+    float fallback = na
+    bool found = false
+    int n = array.size(hScore)
+    if n >= 30
+        for T = thrMin to thrMax
+            if not found
+                float c = 0.0
+                float w = 0.0
+                float sr = 0.0
+                for i = 0 to n - 1
+                    if array.get(hScore, i) >= T
+                        c += 1
+                        sr += array.get(hR, i)
+                        if array.get(hY, i) >= 1.0
+                            w += 1
+                if c >= 10 and sr > 0
+                    float wr = w / c * 100
+                    if wr >= targetWR
+                        res := T
+                        found := true
+                    else if wr > bestWR
+                        bestWR := wr
+                        fallback := T
+    found ? res : nz(fallback, cur)
+
+// ═══ 9. VISUALS ═════════════════════════════════════════════════════════════════
+f_draw(Trade t) =>
+    int x1 = bar_index
+    bool lg = t.dir == 1
+    t.tpBox := box.new(x1, lg ? t.tp : t.entry, x1 + 1, lg ? t.entry : t.tp, border_color = color.new(color.black, 100), border_width = 0, bgcolor = cTPBox)
+    t.slBox := box.new(x1, lg ? t.entry : t.sl, x1 + 1, lg ? t.sl : t.entry, border_color = color.new(color.black, 100), border_width = 0, bgcolor = cSLBox)
+    t.tpLn := line.new(x1, t.tp, x1 + 1, t.tp, color = cTPLine, width = 2)
+    t.slLn := line.new(x1, t.sl, x1 + 1, t.sl, color = cSLLine, width = 2)
+    t.enLn := line.new(x1, t.entry, x1 + 1, t.entry, color = cEntry, width = 1, style = t.isLimit ? line.style_dashed : line.style_solid)
+    if useTP1
+        float l1 = t.entry + t.dir * t.risk
+        t.tp1Ln := line.new(x1, l1, x1 + 1, l1, color = color.new(cTPLine, 50), width = 1, style = line.style_dotted)
+    string tip = showTip ? "Score " + str.tostring(math.round(t.p * 100)) + " | RR 1:" + str.tostring(t.rr, "#.##") + " | " + array.get(SETUPS, t.setup) + " | " + array.get(SESS, t.sess) + (t.isLimit ? " | Limit @ " + str.tostring(t.entry, format.mintick) : "") + " | SL " + str.tostring(t.sl, format.mintick) + " | TP " + str.tostring(t.tp, format.mintick) : ""
+    label.new(x1, lg ? low : high, lg ? "Buy" : "Sell", yloc = lg ? yloc.belowbar : yloc.abovebar, style = lg ? label.style_label_up : label.style_label_down, color = lg ? cBuy : cSell, textcolor = color.white, size = size.normal, tooltip = tip)
+
+f_extend(Trade t) =>
+    box.set_right(t.tpBox, bar_index)
+    box.set_right(t.slBox, bar_index)
+    line.set_x2(t.tpLn, bar_index)
+    line.set_x2(t.slLn, bar_index)
+    line.set_x2(t.enLn, bar_index)
+    if not na(t.tp1Ln)
+        line.set_x2(t.tp1Ln, bar_index)
+
+f_json(Trade t, string ev) =>
+    '{"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","event":"' + ev + '","side":"' + (t.dir == 1 ? "buy" : "sell") + '","entry":' + str.tostring(t.entry, format.mintick) + ',"sl":' + str.tostring(t.sl, format.mintick) + ',"tp":' + str.tostring(t.tp, format.mintick) + ',"rr":' + str.tostring(t.rr, "#.##") + ',"score":' + str.tostring(math.round(t.p * 100)) + ',"setup":"' + array.get(SETUPS, t.setup) + '","session":"' + array.get(SESS, t.sess) + '"}'
+
+// ═══ 10. TRADE ENGINE (confirmed bars only) ══════════════════════════════════════
+var array<Trade> shadows = array.new<Trade>()
+var Trade cur = na
+var float thr = baseScore
+var int closedShadows = 0
+var int sinceRetune = 0
+var int dayLosses = 0
+var int lastLossBar = na
+var float nTr = 0.0
+var float nWin = 0.0
+var float nLoss = 0.0
+var float nScr = 0.0
+var float sumWinR = 0.0
+var float sumLossR = 0.0
+var float sumR = 0.0
+var float sumRR = 0.0
+var int lossStreak = 0
+var int maxLossStreak = 0
+
+bool evBuy = false
+bool evSell = false
+bool evLTP = false
+bool evSTP = false
+bool evLSL = false
+bool evSSL = false
+
+bool inRange = time >= fromDate and time <= toDate
+f_qty(float risk) =>
+    float q = strategy.equity * riskPct / 100 / (risk * syminfo.pointvalue)
+    syminfo.type == "futures" ? math.max(1, math.floor(q)) : math.max(q, 0.01)
+
+if newDay
+    dayLosses := 0
+
+if barstate.isconfirmed
+    // ── a) Resolve shadow trades and learn from every closed one.
+    if array.size(shadows) > 0
+        for i = array.size(shadows) - 1 to 0
+            Trade s = array.get(shadows, i)
+            [o, R] = f_step(s, false)
+            if o == 5
+                array.remove(shadows, i)
+            else if o == 1 or o == 2 or o == 4
+                float y = o == 1 ? 1.0 : o == 2 ? 0.0 : f_clamp(0.5 + 0.5 * R / s.rr, 0, 1)
+                f_learn(s.x, y)
+                array.push(hScore, s.p * 100)
+                array.push(hY, y)
+                array.push(hR, R)
+                if array.size(hScore) > 100
+                    array.shift(hScore)
+                    array.shift(hY)
+                    array.shift(hR)
+                if s.qualified
+                    f_ringPush(s.setup, R)
+                    matrix.set(comboR, s.setup, s.sess, matrix.get(comboR, s.setup, s.sess) + R)
+                    matrix.set(comboN, s.setup, s.sess, matrix.get(comboN, s.setup, s.sess) + 1)
+                closedShadows += 1
+                sinceRetune += 1
+                array.remove(shadows, i)
+    if adaptive and sinceRetune >= 20
+        thr := f_retune(thr)
+        sinceRetune := 0
+
+    // ── b) Manage the displayed trade.
+    if not na(cur)
+        [o, R] = f_step(cur, useTP1)
+        f_extend(cur)
+        if o == 6
+            line.set_style(cur.enLn, line.style_solid)
+        bool lg = cur.dir == 1
+        if cur.beMoved and o == 0 and inRange
+            strategy.exit("Exit", from_entry = lg ? "Long" : "Short", stop = cur.entry, limit = cur.tp)
+        if o >= 1 and o <= 5
+            if o == 1
+                label.new(bar_index, lg ? high : low, lg ? "Long TP" : "Short TP", yloc = lg ? yloc.abovebar : yloc.belowbar, style = lg ? label.style_label_down : label.style_label_up, color = cHit, textcolor = color.white, size = size.normal)
+                evLTP := lg
+                evSTP := not lg
+                alert(f_json(cur, "tp"), alert.freq_once_per_bar_close)
+            else if o == 2 and showSLHit
+                label.new(bar_index, lg ? low : high, lg ? "Long SL" : "Short SL", yloc = lg ? yloc.belowbar : yloc.abovebar, style = lg ? label.style_label_up : label.style_label_down, color = cGrey, textcolor = color.white, size = size.small)
+            else if (o == 3 or o == 4 or o == 5) and showSLHit
+                label.new(bar_index, lg ? high : low, o == 3 ? "BE" : o == 4 ? "Exit" : "Cancelled", yloc = lg ? yloc.abovebar : yloc.belowbar, style = lg ? label.style_label_down : label.style_label_up, color = cGrey, textcolor = color.white, size = size.tiny)
+            if o == 2
+                evLSL := lg
+                evSSL := not lg
+                alert(f_json(cur, "sl"), alert.freq_once_per_bar_close)
+            // Stats. Win rate = wins / (wins + losses); scratches are shown separately.
+            if o != 5
+                int cls = o == 1 ? 1 : o == 2 ? -1 : o == 3 ? (scratchAs == "Win" ? 1 : scratchAs == "Loss" ? -1 : 0) : (R < 0 ? -1 : 0)
+                nTr += 1
+                sumR += R
+                sumRR += cur.rr
+                if R > 0
+                    sumWinR += R
+                if R < 0
+                    sumLossR += -R
+                if cls == 1
+                    nWin += 1
+                    lossStreak := 0
+                else if cls == -1
+                    nLoss += 1
+                    lossStreak += 1
+                    maxLossStreak := math.max(maxLossStreak, lossStreak)
+                    dayLosses += 1
+                    lastLossBar := bar_index
+                else
+                    nScr += 1
+            if o == 5
+                strategy.cancel(lg ? "Long" : "Short")
+            else
+                strategy.close_all(comment = o == 4 ? "Timeout" : "Exit")
+            cur := na
+
+    // ── c) Build this bar's candidates.
+    array<Trade> cands = array.new<Trade>()
+    if not blackout and sessAllowed and roomOK and not na(atr14)
+        array<float> lv = f_levels()
+        if aLong
+            bool lim = entryModeA == "Limit at FVG" and bullFvgNew
+            Trade c = f_cand(1, 0, lim ? low : close, swBullExt - slBuf * atr14, lv, lim, true, bullFvgNew or tBullOB, swBullPD)
+            if not na(c)
+                array.push(cands, c)
+            swBullBar := na
+        if aShort
+            bool lim = entryModeA == "Limit at FVG" and bearFvgNew
+            Trade c = f_cand(-1, 0, lim ? high : close, swBearExt + slBuf * atr14, lv, lim, true, bearFvgNew or tBearOB, swBearPD)
+            if not na(c)
+                array.push(cands, c)
+            swBearBar := na
+        if bLong
+            Trade c = f_cand(1, 1, close, math.min(low, bLongZone) - slBuf * atr14, lv, false, sweepInLong, tBullOB or bullFvgTouch, false)
+            if not na(c)
+                array.push(cands, c)
+        if bShort
+            Trade c = f_cand(-1, 1, close, math.max(high, bShortZone) + slBuf * atr14, lv, false, sweepInShort, tBearOB or bearFvgTouch, false)
+            if not na(c)
+                array.push(cands, c)
+        if cLong
+            float raw = math.max(boL, boH - math.max(0.6 * atr14, 0.5 * (boH - boL))) - slBuf * atr14
+            Trade c = f_cand(1, 2, retestC ? boH : close, raw, lv, retestC, sweepInLong, bullFvgNew, false)
+            if not na(c)
+                array.push(cands, c)
+            sqUsed := true
+        if cShort
+            float raw = math.min(boH, boL + math.max(0.6 * atr14, 0.5 * (boH - boL))) + slBuf * atr14
+            Trade c = f_cand(-1, 2, retestC ? boL : close, raw, lv, retestC, sweepInShort, bearFvgNew, false)
+            if not na(c)
+                array.push(cands, c)
+            sqUsed := true
+        if dLong
+            Trade c = f_cand(1, 3, close, low - slBuf * atr14, array.from(vw - sd, vw), false, sweepInLong, false, false)
+            if not na(c)
+                array.push(cands, c)
+        if dShort
+            Trade c = f_cand(-1, 3, close, high + slBuf * atr14, array.from(vw + sd, vw), false, sweepInShort, false, false)
+            if not na(c)
+                array.push(cands, c)
+
+    // ── d) Every candidate becomes a shadow trade (one open per setup+direction),
+    //       so the model learns from the full set, not only from what it displayed.
+    Trade best = na
+    for c in cands
+        c.qualified := c.p * 100 >= thr
+        bool dup = false
+        for s in shadows
+            if s.setup == c.setup and s.dir == c.dir
+                dup := true
+        if not dup and array.size(shadows) < 60
+            array.push(shadows, c.copy())
+        float need = thr + (c.sess == 3 ? nyPmExtra : 0)
+        bool counter = c.setup == 0 and biasSign == -c.dir
+        if counter
+            need := math.max(need, 85)
+        bool okC = c.p * 100 >= need and not array.get(setupOff, c.setup) and (not counter or c.pdSweep)
+        if okC and (na(best) or c.p > best.p)
+            best := c
+
+    // ── e) Display gate: warm-up done, nothing open, no cooldown / daily stop.
+    bool canShow = na(cur) and closedShadows >= warmupN and dayLosses < maxDayLoss and (na(lastLossBar) or bar_index - lastLossBar > cooldownN)
+    if canShow and not na(best)
+        cur := best.copy()
+        f_draw(cur)
+        evBuy := cur.dir == 1
+        evSell := cur.dir == -1
+        alert(f_json(cur, cur.isLimit ? "limit" : "entry"), alert.freq_once_per_bar_close)
+        if inRange
+            string id = cur.dir == 1 ? "Long" : "Short"
+            strategy.entry(id, cur.dir == 1 ? strategy.long : strategy.short, qty = f_qty(cur.risk), limit = cur.isLimit ? cur.entry : na)
+            strategy.exit("Exit", from_entry = id, stop = cur.sl, limit = cur.tp)
+
+// ═══ 11. OPTIONAL OVERLAYS ══════════════════════════════════════════════════════
+plot(showVwap ? vw : na, "VWAP", color = color.new(#F7C548, 0), linewidth = 1)
+plot(showVwap ? vw + sd : na, "VWAP +1σ", color = color.new(#F7C548, 60))
+plot(showVwap ? vw - sd : na, "VWAP −1σ", color = color.new(#F7C548, 60))
+plot(showVwap ? vw + 2 * sd : na, "VWAP +2σ", color = color.new(#F7C548, 75))
+plot(showVwap ? vw - 2 * sd : na, "VWAP −2σ", color = color.new(#F7C548, 75))
+plot(showVwap ? vw + 3 * sd : na, "VWAP +3σ", color = color.new(#F7C548, 85))
+plot(showVwap ? vw - 3 * sd : na, "VWAP −3σ", color = color.new(#F7C548, 85))
+plot(showLevels ? pdh : na, "PDH", color = color.new(#2ECC71, 40), style = plot.style_linebr)
+plot(showLevels ? pdl : na, "PDL", color = color.new(#F23645, 40), style = plot.style_linebr)
+plot(showLevels ? pPOC : na, "Prior POC", color = color.new(#D500F9, 40), style = plot.style_linebr)
+plot(showLevels ? pVAH : na, "Prior VAH", color = color.new(#5B6CD8, 50), style = plot.style_linebr)
+plot(showLevels ? pVAL : na, "Prior VAL", color = color.new(#5B6CD8, 50), style = plot.style_linebr)
+
+// ═══ 12. DASHBOARD ══════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 17, bgcolor = color.new(#131722, 10), border_color = color.new(#2A2E39, 0), border_width = 1, frame_color = color.new(#2A2E39, 0), frame_width = 1)
+f_row(int r, string k, string v, color vc) =>
+    table.cell(dash, 0, r, k, text_color = color.new(color.white, 35), text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+if showDash and barstate.islast
+    color cW = color.white
+    string biasTxt = (biasSign == 1 ? "BULLISH" : biasSign == -1 ? "BEARISH" : "NEUTRAL") + " (" + (biasScore >= 0 ? "+" : "") + str.tostring(math.round(biasScore)) + ")"
+    color biasCol = biasSign == 1 ? cBuy : biasSign == -1 ? cSell : cGrey
+    string regTxt = (atrPct < 20 or sqzOn ? "Compression" : trending ? "Trending" : meanRev ? "Mean-reverting" : "Normal") + " · ATR " + str.tostring(math.round(atrPct)) + "%"
+    string sesTxt = blackout ? "News blackout" : array.get(SESS, sessId)
+    float wr = nWin + nLoss > 0 ? nWin / (nWin + nLoss) * 100 : na
+    float pf = sumLossR > 0 ? sumWinR / sumLossR : na
+    float ex = nTr > 0 ? sumR / nTr : na
+    // Best / worst setup by expectancy over its last 50 qualified shadow trades.
+    int bS = -1
+    int wS = -1
+    float bE = na
+    float wE = na
+    for s = 0 to 3
+        float e = f_ringExp(s, 50)
+        if array.get(ringCnt, s) >= 10 and not na(e)
+            if na(bE) or e > bE
+                bE := e
+                bS := s
+            if na(wE) or e < wE
+                wE := e
+                wS := s
+    // Best setup × session combination (min 10 qualified trades).
+    string comboTxt = "—"
+    float cBest = na
+    for s = 0 to 3
+        for j = 0 to 5
+            float n = matrix.get(comboN, s, j)
+            if n >= 10
+                float e = matrix.get(comboR, s, j) / n
+                if na(cBest) or e > cBest
+                    cBest := e
+                    comboTxt := array.get(SETUPS, s) + " @ " + array.get(SESS, j) + " (" + str.tostring(e, "+0.00;-0.00") + "R)"
+    f_row(0, "GOLD SNIPER", timeframe.period + (supportedTF ? "" : "  ⚠"), cHit)
+    f_row(1, "Daily bias", biasTxt, biasCol)
+    f_row(2, "Regime", regTxt, cW)
+    f_row(3, "Session", sesTxt, blackout ? cSell : cW)
+    f_row(4, "ADR used", str.tostring(math.round(adrUsed * 100)) + "%", adrUsed > 0.85 ? cSell : cW)
+    f_row(5, "Threshold", str.tostring(math.round(thr)) + (adaptive ? " (adaptive)" : ""), cW)
+    f_row(6, "Trades", str.tostring(nTr, "#") + "  W " + str.tostring(nWin, "#") + " / L " + str.tostring(nLoss, "#") + " / S " + str.tostring(nScr, "#"), cW)
+    f_row(7, "Win rate", na(wr) ? "—" : str.tostring(wr, "#.0") + "%", na(wr) ? cW : wr >= targetWR ? cBuy : cSell)
+    f_row(8, "Avg planned RR", nTr > 0 ? "1:" + str.tostring(sumRR / nTr, "#.00") : "—", cW)
+    f_row(9, "Profit factor", na(pf) ? "—" : str.tostring(pf, "#.00"), na(pf) ? cW : pf >= 1 ? cBuy : cSell)
+    f_row(10, "Expectancy", na(ex) ? "—" : str.tostring(ex, "+0.00;-0.00") + "R", na(ex) ? cW : ex >= 0 ? cBuy : cSell)
+    f_row(11, "Max loss streak", str.tostring(maxLossStreak), cW)
+    f_row(12, "Best setup", bS >= 0 ? array.get(SETUPS, bS) + " (" + str.tostring(bE, "+0.00;-0.00") + "R)" : "—", cW)
+    f_row(13, "Worst setup", wS >= 0 ? array.get(SETUPS, wS) + " (" + str.tostring(wE, "+0.00;-0.00") + "R)" + (array.get(setupOff, wS) ? " OFF" : "") : "—", cW)
+    f_row(14, "Best combo", comboTxt, cW)
+    f_row(15, "Model", closedShadows < warmupN ? "Warming up (" + str.tostring(closedShadows) + "/" + str.tostring(warmupN) + ")" : "Active · " + str.tostring(closedShadows) + " trades learned", closedShadows < warmupN ? cGrey : cBuy)
+    f_row(16, supportedTF ? "Volume" : "Note", supportedTF ? (gcOk ? "COMEX GC futures" : "Chart tick volume") : "Optimised for 1m / 5m / 15m", supportedTF ? cW : cSell)
+
+// ═══ 13. ALERTS ═════════════════════════════════════════════════════════════════
+// alert() calls above send a JSON payload (symbol, tf, event, side, entry, sl, tp,
+// rr, score, setup, session) — create the alert with "Any alert() function call".
