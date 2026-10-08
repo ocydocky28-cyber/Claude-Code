@@ -37,6 +37,37 @@ To backtest, open a new Pine Editor tab, paste `GoldSniper_Strategy.pine`, add i
 
 More signals means a lower win rate per trade. Compare the dashboard's **Expectancy** and **Profit factor** between modes, not just the win rate.
 
+## The unified strategy: order flow + 5-pillar confluence
+
+Every candidate trade, from any setup, goes through the same checklist.
+
+**1. Order Flow score (0–100, 50 = neutral)**, read from the 1-minute bars inside each candle:
+
+| Part | Weight | What it means |
+|---|---|---|
+| Delta % | 25 | Who was aggressive in this candle (buy vs sell volume) |
+| CVD slope | 20 | Who has been in control over the last 5 bars |
+| Bar VPOC | 15 | Where the most volume traded inside the candle. For a long, volume traded at the low and price closed away from it: buyers absorbed the sellers. |
+| Trapped traders | 15 | The previous candle's heavy aggressive sellers are underwater because this candle closed above its high (or the reverse) |
+| Absorption | 10 | Heavy volume and a small body, closing on the trade's side |
+| Stacked aggression | 10 | 4+ consecutive 1-minute bars on the same side |
+| Relative volume | 5 | Size is in the market |
+
+If the score is below *Min order-flow score* (45), the trade is **vetoed** because order flow is working against it.
+
+**2. Five confluence pillars.** Each pillar the trade meets adds one to its grade:
+1. **Bias:** the daily bias agrees with the trade.
+2. **Location:** price is at a key level (PDH/PDL, session range, value area, VWAP band, anchored VWAP, order block, gap or sweep).
+3. **Trigger:** one of the five setups fired.
+4. **Order flow:** the score is 60 or more.
+5. **Regime:** the setup suits the current market. Pullbacks and trend flips need a trend, fades need a mean-reverting market, and breakouts need compression.
+
+The grade (**A+** = 5/5, **A** = 4/5, **B** = 3/5) shows on the Entry price tag and in the Buy/Sell tooltip. *Min confluence pillars* defaults to 3. Sniper mode requires 4. Set it to **4 or 5 for the highest win rate**.
+
+The order-flow score, trapped-trader flag, stacked-aggression flag and grade are also inputs to the learning model. It learns how much each one matters on your chart.
+
+On a **1m chart** there is only one 1-minute bar inside each candle, so the order-flow parts use body-based estimates. Order flow is most informative on **5m and 15m**.
+
 ## Target style (Setups → Target style)
 
 | Style | Targets | Effect |
