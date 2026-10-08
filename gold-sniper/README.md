@@ -27,7 +27,21 @@ To backtest, open a new Pine Editor tab, paste `GoldSniper_Strategy.pine`, add i
 
 ---
 
-## The four setups in plain English
+## Signal mode (Setups → Signal mode)
+
+| Mode | What you get |
+|---|---|
+| **Frequent** (default) | Many signals through the day. All sessions are open and setup rules are looser. If no real level gives the minimum RR, it uses a fixed minimum-RR target. The threshold is tuned for the **most total profit** (R), not the highest win rate. A qualifying signal in the opposite direction closes the open trade (grey "Exit") and flips. |
+| **Balanced** | Fewer signals. The threshold is tuned to your *Target win rate*. Session toggles apply and nothing flips. |
+| **Sniper** | Only the highest-scoring setups. The threshold never drops below 60. |
+
+More signals means a lower win rate per trade. Compare the dashboard's **Expectancy** and **Profit factor** between modes, not just the win rate.
+
+## The five setups in plain English
+
+**E. Trend Flip (the most frequent setup)**
+An ATR trailing trend (Supertrend: factor 2.0 on 1m, 2.5 on 5m, 3.0 on 15m) flips direction. The flip candle must close in the direction of the move with buying or selling pressure (delta) behind it. The higher timeframes can't be strongly against it. The stop goes behind the last 5-bar swing. In Balanced and Sniper modes it also needs the daily bias on its side and price on the right side of VWAP.
+
 
 **A. Liquidity Sweep Reversal (the main setup)**
 Stop-losses build up above obvious highs and below obvious lows: yesterday's high/low, last week's high/low, the Asian range, the London range, and equal highs/lows. Big players push price through those levels to fill their orders. The setup needs four things in a row:

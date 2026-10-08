@@ -45,10 +45,12 @@ strategy("Gold Sniper Strategy [XAUUSD]", "GS Strat", overlay = true, max_boxes_
 
 // ─── INPUTS ──────────────────────────────────────────────────────────────────────
 string G_SET = "Setups"
+string sigMode = input.string("Frequent", "Signal mode", options = ["Frequent", "Balanced", "Sniper"], group = G_SET, tooltip = "Frequent: many signals through the day. All sessions open, looser setup rules, a fixed-RR target when no level fits, the threshold tuned for the most total profit, and a strong opposite signal closes the open trade and flips. Balanced: fewer signals, the threshold tuned for your target win rate. Sniper: only the highest-scoring setups.")
 bool inA = input.bool(true, "A · Liquidity Sweep Reversal", group = G_SET, tooltip = "Price raids an obvious high/low where stop-losses sit, closes back inside with volume, then breaks structure the other way. The main setup, best in London and NY AM.")
 bool inB = input.bool(true, "B · Trend Pullback Continuation", group = G_SET, tooltip = "In a trending market, price pulls back into VWAP, the VWAP 1σ band, a fair-value gap or an order block and rejects it with buying/selling pressure.")
 bool inC = input.bool(true, "C · Compression Breakout", group = G_SET, tooltip = "After 10+ bars of volatility squeeze, price breaks the range with high relative volume and delta in the bias direction.")
 bool inD = input.bool(true, "D · VWAP Band Fade", group = G_SET, tooltip = "Only in a mean-reverting regime: price stretches 2σ+ from VWAP into a key level, shows absorption or delta divergence, and is faded back toward VWAP.")
+bool inE = input.bool(true, "E · Trend Flip", group = G_SET, tooltip = "The most frequent setup. An ATR trailing trend (Supertrend) flips direction on a candle closing with the move and with buying/selling pressure behind it, while the higher timeframes aren't strongly against it. Stop behind the last 5-bar swing.")
 string entryModeA = input.string("Market on confirmation", "Sweep entry", options = ["Market on confirmation", "Limit at FVG"], group = G_SET, tooltip = "Market: enter at the close of the bar that confirms the structure shift. Limit: place a limit order at the fair-value gap left by the displacement candle (better price, but some trades won't fill).")
 bool retestC = input.bool(true, "Breakout: wait for retest", group = G_SET, tooltip = "On: place a limit order back at the broken range edge. Off: enter at the close of the breakout candle.")
 int nMSS = input.int(6, "Bars allowed from sweep to structure shift", minval = 1, maxval = 30, group = G_SET, tooltip = "How many bars after a liquidity sweep the structure shift may happen for the sweep setup to stay valid.")
@@ -134,6 +136,16 @@ int pivLen = usePreset ? (is1 ? 3 : is5 ? 4 : 5) : mPiv
 float slBuf = usePreset ? (is1 ? 0.3 : is5 ? 0.25 : 0.2) : mBuf
 int baseScore = usePreset ? (is1 ? 75 : is5 ? 70 : 68) : mScore
 float minRR = usePreset ? (is15 ? 1.8 : 1.5) : mRR
+bool modeF = sigMode == "Frequent"
+bool modeS = sigMode == "Sniper"
+float dispK = modeF ? 0.9 : 1.2
+int sqzMin = modeF ? 6 : 10
+float rvolBO = modeF ? 1.3 : 1.8
+float stFactor = is1 ? 2.0 : is5 ? 2.5 : 3.0
+int warmEff = modeF ? math.min(warmupN, 10) : warmupN
+int cooldownEff = modeF ? 0 : cooldownN
+int maxDayLossEff = modeF ? math.max(maxDayLoss, 6) : maxDayLoss
+int thrMinEff = modeS ? math.max(thrMin, 60) : thrMin
 int maxBars = usePreset ? (is1 ? 60 : is5 ? 48 : 32) : mMaxBars
 
 // Higher timeframes used for the bias on each chart timeframe.
@@ -146,8 +158,8 @@ string wkTF = tfSec <= 604800 ? "W" : timeframe.period
 string hourTF = tfSec <= 3600 ? "60" : timeframe.period
 string ltf = tfSec > 60 ? "1" : timeframe.period
 
-const int NF = 27
-var array<string> SETUPS = array.from("Sweep Reversal", "Trend Pullback", "Compression Breakout", "VWAP Fade")
+const int NF = 28
+var array<string> SETUPS = array.from("Sweep Reversal", "Trend Pullback", "Compression Breakout", "VWAP Fade", "Trend Flip")
 var array<string> SESS = array.from("Asia", "London", "NY AM", "NY PM", "Transition", "Dead zone")
 
 // ─── TYPES ───────────────────────────────────────────────────────────────────────
@@ -399,7 +411,7 @@ f_inNews(int t) =>
     t > timestamp("2001-01-01T00:00:00+00:00") and time_close > t - newsBefore * 60000 and time < t + newsAfter * 60000
 bool nfpNow = nfpAuto and dayofweek(time, "America/New_York") == dayofweek.friday and dayofmonth(time, "America/New_York") <= 7 and tod >= 510 - newsBefore and tod < 510 + newsAfter
 bool blackout = nfpNow or f_inNews(news1) or f_inNews(news2) or f_inNews(news3) or f_inNews(news4) or f_inNews(news5)
-bool sessAllowed = sessId == 0 ? allowAsia : sessId == 4 ? allowOther : sessId == 5 ? not blockDead : true
+bool sessAllowed = modeF ? true : sessId == 0 ? allowAsia : sessId == 4 ? allowOther : sessId == 5 ? not blockDead : true
 
 // ═══ 2. VOLUME & ORDER FLOW ══════════════════════════════════════════════════════
 // VWAP is the price institutions benchmark their fills against; its σ bands show
@@ -566,8 +578,8 @@ if bearBreak
 // Displacement: one big candle (≥1.2 ATR body) or two strong ones in a row.
 bool strongBull = close > open and body >= 0.6 * atr14
 bool strongBear = close < open and body >= 0.6 * atr14
-bool dispBull = (close > open and body >= 1.2 * atr14) or (strongBull and strongBull[1])
-bool dispBear = (close < open and body >= 1.2 * atr14) or (strongBear and strongBear[1])
+bool dispBull = (close > open and body >= dispK * atr14) or (strongBull and strongBull[1])
+bool dispBear = (close < open and body >= dispK * atr14) or (strongBear and strongBear[1])
 
 // Fair-value gaps (3-candle imbalances > 0.25 ATR), tracked until 50% filled.
 var array<float> bfTop = array.new<float>()
@@ -877,15 +889,15 @@ bool tShortVW = high >= vw - 0.1 * atr14 and close < vw
 bool tShortB1 = sd > 0 and high >= vw + sd and close < vw + sd
 bool rejBull = close > open and rng > 0 and (close - low) >= 0.6 * rng and deltaN > 0
 bool rejBear = close < open and rng > 0 and (high - close) >= 0.6 * rng and deltaN < 0
-bool bLong = inB and trending and trendTF == 1 and htfAvg > 0.2 and (tLongVW or tLongB1 or tBullOB or bullFvgTouch) and rejBull and (not pdFilter or pdPos <= 0.5) and adrUsed < 0.85 and mtfLong
-bool bShort = inB and trending and trendTF == -1 and htfAvg < -0.2 and (tShortVW or tShortB1 or tBearOB or bearFvgTouch) and rejBear and (not pdFilter or pdPos >= 0.5) and adrUsed < 0.85 and mtfShort
+bool bLong = inB and (modeF ? not meanRev : trending) and trendTF == 1 and htfAvg > 0.2 and (tLongVW or tLongB1 or tBullOB or bullFvgTouch) and rejBull and (not pdFilter or modeF or pdPos <= 0.5) and adrUsed < 0.85 and mtfLong
+bool bShort = inB and (modeF ? not meanRev : trending) and trendTF == -1 and htfAvg < -0.2 and (tShortVW or tShortB1 or tBearOB or bearFvgTouch) and rejBear and (not pdFilter or modeF or pdPos >= 0.5) and adrUsed < 0.85 and mtfShort
 float bLongZone = tBullOB ? bObB : bullFvgTouch ? bullFvgTouchBot : tLongB1 ? vw - sd : vw
 float bShortZone = tBearOB ? sObT : bearFvgTouch ? bearFvgTouchTop : tShortB1 ? vw + sd : vw
 
 // C · Compression breakout: 10+ squeeze bars, quiet ATR, then volume + delta break.
-bool cBase = inC and not sqUsed and boN >= 10 and nz(atrPct[1], 100) < 30 and rvol >= 1.8 and adrUsed < 0.85
-bool cLong = cBase and close > boH and close[1] <= boH and deltaN > 0 and biasSign == 1 and mtfLong
-bool cShort = cBase and close < boL and close[1] >= boL and deltaN < 0 and biasSign == -1 and mtfShort
+bool cBase = inC and not sqUsed and boN >= sqzMin and nz(atrPct[1], 100) < (modeF ? 50 : 30) and rvol >= rvolBO and adrUsed < 0.85
+bool cLong = cBase and close > boH and close[1] <= boH and deltaN > 0 and (modeF ? biasSign >= 0 : biasSign == 1) and mtfLong
+bool cShort = cBase and close < boL and close[1] >= boL and deltaN < 0 and (modeF ? biasSign <= 0 : biasSign == -1) and mtfShort
 
 // D · VWAP band fade: mean-reverting regime, 2σ stretch into a key level + exhaustion.
 f_near(float price, array<float> lv, float tol) =>
@@ -900,11 +912,20 @@ if inD and meanRev and sd > 0.3 * atr14
     if high >= vw + 2 * sd and close < vw + 2 * sd and (absorb or bearDDivRecent)
         array<float> keyHi = array.from(pdh, pwh, asiaH, lonH, pVAH, pPOC)
         array.concat(keyHi, poolHi)
-        dShort := (f_near(high, keyHi, 0.35 * atr14) or bearSweep) and mtfShortSoft
+        dShort := (modeF or f_near(high, keyHi, 0.35 * atr14) or bearSweep) and mtfShortSoft
     if low <= vw - 2 * sd and close > vw - 2 * sd and (absorb or bullDDivRecent)
         array<float> keyLo = array.from(pdl, pwl, asiaL, lonL, pVAL, pPOC)
         array.concat(keyLo, poolLo)
-        dLong := (f_near(low, keyLo, 0.35 * atr14) or bullSweep) and mtfLongSoft
+        dLong := (modeF or f_near(low, keyLo, 0.35 * atr14) or bullSweep) and mtfLongSoft
+
+// E · Trend flip: ATR trailing trend turns, confirmed by the candle and by delta.
+[stLine, stDir] = ta.supertrend(stFactor, 10)
+float ll5 = ta.lowest(low, 5)
+float hh5 = ta.highest(high, 5)
+bool flipUp = stDir < 0 and nz(stDir[1]) > 0
+bool flipDn = stDir > 0 and nz(stDir[1]) < 0
+bool eLong = inE and flipUp and close > open and deltaN > 0 and htfAvg > -0.5 and mtfLongSoft and (modeF or (biasSign >= 0 and close > vw))
+bool eShort = inE and flipDn and close < open and deltaN < 0 and htfAvg < 0.5 and mtfShortSoft and (modeF or (biasSign <= 0 and close < vw))
 
 bool sweepInLong = not na(swBullBar) or bullSweep
 bool sweepInShort = not na(swBearBar) or bearSweep
@@ -933,6 +954,9 @@ f_pickTP(int dir, float entry, float risk, array<float> lv) =>
             if dist > 0 and dist / risk >= minRR and dist <= maxDist
                 if na(best) or dist < (best - entry) * dir
                     best := tgt
+    // Frequent mode: no real level at the minimum RR → fixed minimum-RR target.
+    if na(best) and modeF and minRR * risk <= maxDist
+        best := entry + dir * minRR * risk
     best
 
 // Stop clamped to [0.5, 2.5] × ATR: too tight → widened, too wide → trade skipped.
@@ -956,10 +980,10 @@ f_finalSL(int dir, float entry, float rawSL) =>
 //  6 displacement strength    15 session Asia              24 RSI divergence
 //  7 FVG / order block        16 premium/discount position 25 delta divergence
 //  8 VWAP z-score (toward)    17 DXY / yields agreement    26 regression slope
-//  27 = bias term
+//  27 setup E (trend flip)    28 = bias term
 // Starting weights are hand-tuned priors (sweep, bias and HTF heaviest; higher RR
 // and farther targets lower the probability) so it works from the first bar.
-var array<float> W = array.from(0.9, 0.6, 0.3, 0.4, 0.25, 0.7, 0.4, 0.3, 0.2, 0.15, 0.1, -0.2, 0.15, 0.3, -0.15, -0.3, 0.35, 0.3, 0.35, 0.15, 0.0, 0.1, -0.6, -0.5, 0.2, 0.3, 0.25, -0.9)
+var array<float> W = array.from(0.9, 0.6, 0.3, 0.4, 0.25, 0.7, 0.4, 0.3, 0.2, 0.15, 0.1, -0.2, 0.15, 0.3, -0.15, -0.3, 0.35, 0.3, 0.35, 0.15, 0.0, 0.1, -0.6, -0.5, 0.2, 0.3, 0.25, 0.1, -0.9)
 
 f_prob(array<float> x) =>
     float z = array.get(W, NF)
@@ -994,7 +1018,7 @@ f_feats(int dir, int setup, float rr, float tpDist, bool sweepIn, float dispS, b
     array.set(x, 15, sessId == 0 ? 1.0 : 0.0)
     array.set(x, 16, f_clamp((0.5 - pdPos) * 2 * dir, -1, 1))
     array.set(x, 17, f_clamp(dxyAgree * dir, -1, 1))
-    array.set(x, 18 + setup, 1.0)
+    array.set(x, setup == 4 ? 27 : 18 + setup, 1.0)
     array.set(x, 22, f_clamp((rr - 1) / 3, 0, 1))
     array.set(x, 23, adrD > 0 ? f_clamp(tpDist / adrD, 0, 1) : 0.0)
     array.set(x, 24, (dir == 1 ? bullRsiDivRecent : bearRsiDivRecent) ? 1.0 : 0.0)
@@ -1053,12 +1077,12 @@ f_step(Trade t, bool useBE) =>
 var array<float> hScore = array.new<float>()
 var array<float> hY = array.new<float>()
 var array<float> hR = array.new<float>()
-var matrix<float> ringR = matrix.new<float>(4, 50, na)
-var array<int> ringPtr = array.new<int>(4, 0)
-var array<int> ringCnt = array.new<int>(4, 0)
-var array<bool> setupOff = array.new<bool>(4, false)
-var matrix<float> comboR = matrix.new<float>(4, 6, 0.0)
-var matrix<float> comboN = matrix.new<float>(4, 6, 0.0)
+var matrix<float> ringR = matrix.new<float>(5, 50, na)
+var array<int> ringPtr = array.new<int>(5, 0)
+var array<int> ringCnt = array.new<int>(5, 0)
+var array<bool> setupOff = array.new<bool>(5, false)
+var matrix<float> comboR = matrix.new<float>(5, 6, 0.0)
+var matrix<float> comboN = matrix.new<float>(5, 6, 0.0)
 
 f_ringExp(int s, int n) =>
     int c = math.min(array.get(ringCnt, s), n)
@@ -1089,7 +1113,7 @@ f_retune(float cur) =>
     bool found = false
     int n = array.size(hScore)
     if n >= 30
-        for T = thrMin to thrMax
+        for T = thrMinEff to thrMax
             if not found
                 float c = 0.0
                 float w = 0.0
@@ -1100,7 +1124,12 @@ f_retune(float cur) =>
                         sr += array.get(hR, i)
                         if array.get(hY, i) >= 1.0
                             w += 1
-                if c >= 10 and sr > 0
+                if c >= 10 and sr > 0 and modeF
+                    // Frequent: the threshold that produced the most total R.
+                    if sr > bestWR
+                        bestWR := sr
+                        fallback := T
+                else if c >= 10 and sr > 0
                     float wr = w / c * 100
                     if wr >= targetWR
                         res := T
@@ -1148,7 +1177,7 @@ f_json(Trade t, string ev) =>
 // ═══ 10. TRADE ENGINE (confirmed bars only) ══════════════════════════════════════
 var array<Trade> shadows = array.new<Trade>()
 var Trade cur = na
-var float thr = baseScore
+var float thr = modeF ? 50 : baseScore
 var int closedShadows = 0
 var int nCandTotal = 0
 var int sinceRetune = 0
@@ -1213,9 +1242,90 @@ if barstate.isconfirmed
         thr := f_retune(thr)
         sinceRetune := 0
 
-    // ── b) Manage the displayed trade.
+    // ── c) Build this bar's candidates.
+    array<Trade> cands = array.new<Trade>()
+    if not blackout and sessAllowed and roomOK and not na(atr14)
+        array<float> lv = f_levels()
+        if aLong
+            bool lim = entryModeA == "Limit at FVG" and bullFvgNew
+            Trade c = f_cand(1, 0, lim ? low : close, swBullExt - slBuf * atr14, lv, lim, true, bullFvgNew or tBullOB, swBullPD)
+            if not na(c)
+                array.push(cands, c)
+            swBullBar := na
+        if aShort
+            bool lim = entryModeA == "Limit at FVG" and bearFvgNew
+            Trade c = f_cand(-1, 0, lim ? high : close, swBearExt + slBuf * atr14, lv, lim, true, bearFvgNew or tBearOB, swBearPD)
+            if not na(c)
+                array.push(cands, c)
+            swBearBar := na
+        if bLong
+            Trade c = f_cand(1, 1, close, math.min(low, bLongZone) - slBuf * atr14, lv, false, sweepInLong, tBullOB or bullFvgTouch, false)
+            if not na(c)
+                array.push(cands, c)
+        if bShort
+            Trade c = f_cand(-1, 1, close, math.max(high, bShortZone) + slBuf * atr14, lv, false, sweepInShort, tBearOB or bearFvgTouch, false)
+            if not na(c)
+                array.push(cands, c)
+        if cLong
+            float raw = math.max(boL, boH - math.max(0.6 * atr14, 0.5 * (boH - boL))) - slBuf * atr14
+            Trade c = f_cand(1, 2, retestC ? boH : close, raw, lv, retestC, sweepInLong, bullFvgNew, false)
+            if not na(c)
+                array.push(cands, c)
+            sqUsed := true
+        if cShort
+            float raw = math.min(boH, boL + math.max(0.6 * atr14, 0.5 * (boH - boL))) + slBuf * atr14
+            Trade c = f_cand(-1, 2, retestC ? boL : close, raw, lv, retestC, sweepInShort, bearFvgNew, false)
+            if not na(c)
+                array.push(cands, c)
+            sqUsed := true
+        if eLong
+            Trade c = f_cand(1, 4, close, ll5 - slBuf * atr14, lv, false, sweepInLong, bullFvgNew, false)
+            if not na(c)
+                array.push(cands, c)
+        if eShort
+            Trade c = f_cand(-1, 4, close, hh5 + slBuf * atr14, lv, false, sweepInShort, bearFvgNew, false)
+            if not na(c)
+                array.push(cands, c)
+        if dLong
+            Trade c = f_cand(1, 3, close, low - slBuf * atr14, array.from(vw - sd, vw), false, sweepInLong, false, false)
+            if not na(c)
+                array.push(cands, c)
+        if dShort
+            Trade c = f_cand(-1, 3, close, high + slBuf * atr14, array.from(vw + sd, vw), false, sweepInShort, false, false)
+            if not na(c)
+                array.push(cands, c)
+
+    // ── d) Every candidate becomes a shadow trade (one open per setup+direction),
+    //       so the model learns from the full set, not only from what it displayed.
+    Trade best = na
+    for c in cands
+        nCandTotal += 1
+        evCandL := evCandL or c.dir == 1
+        evCandS := evCandS or c.dir == -1
+        c.qualified := c.p * 100 >= thr
+        bool dup = false
+        for s in shadows
+            if s.setup == c.setup and s.dir == c.dir
+                dup := true
+        if not dup and array.size(shadows) < 60
+            array.push(shadows, c.copy())
+        float need = thr + (c.sess == 3 ? nyPmExtra : 0)
+        bool counter = c.setup == 0 and biasSign == -c.dir
+        if counter
+            need := modeF ? need + 10 : math.max(need, 85)
+        bool okC = c.p * 100 >= need and not array.get(setupOff, c.setup) and (not counter or modeF or c.pdSweep)
+        if okC and (na(best) or c.p > best.p)
+            best := c
+
+    // ── b) Manage the displayed trade (after candidates, so a flip can close it).
     if not na(cur)
-        [o, R] = f_step(cur, useTP1)
+        [o0, R0] = f_step(cur, useTP1)
+        int o = o0
+        float R = R0
+        // Frequent mode: a qualifying opposite signal closes this trade and flips.
+        if modeF and not na(best) and best.dir == -cur.dir and (o == 0 or o == 6)
+            o := cur.filled ? 4 : 5
+            R := cur.filled ? (close - cur.entry) * cur.dir / cur.risk : 0.0
         f_extend(cur)
         if o == 6
             line.set_style(cur.enLn, line.style_solid)
@@ -1264,82 +1374,15 @@ if barstate.isconfirmed
             if o == 5
                 strategy.cancel(lg ? "Long" : "Short")
             else
-                strategy.close_all(comment = o == 4 ? "Timeout" : "Exit")
+                strategy.close_all(comment = o == 4 ? "Exit" : "TP/SL", immediately = true)
             // ==== END STRAT
             label.delete(cur.tpLbl)
             label.delete(cur.enLbl)
             label.delete(cur.slLbl)
             cur := na
 
-    // ── c) Build this bar's candidates.
-    array<Trade> cands = array.new<Trade>()
-    if not blackout and sessAllowed and roomOK and not na(atr14)
-        array<float> lv = f_levels()
-        if aLong
-            bool lim = entryModeA == "Limit at FVG" and bullFvgNew
-            Trade c = f_cand(1, 0, lim ? low : close, swBullExt - slBuf * atr14, lv, lim, true, bullFvgNew or tBullOB, swBullPD)
-            if not na(c)
-                array.push(cands, c)
-            swBullBar := na
-        if aShort
-            bool lim = entryModeA == "Limit at FVG" and bearFvgNew
-            Trade c = f_cand(-1, 0, lim ? high : close, swBearExt + slBuf * atr14, lv, lim, true, bearFvgNew or tBearOB, swBearPD)
-            if not na(c)
-                array.push(cands, c)
-            swBearBar := na
-        if bLong
-            Trade c = f_cand(1, 1, close, math.min(low, bLongZone) - slBuf * atr14, lv, false, sweepInLong, tBullOB or bullFvgTouch, false)
-            if not na(c)
-                array.push(cands, c)
-        if bShort
-            Trade c = f_cand(-1, 1, close, math.max(high, bShortZone) + slBuf * atr14, lv, false, sweepInShort, tBearOB or bearFvgTouch, false)
-            if not na(c)
-                array.push(cands, c)
-        if cLong
-            float raw = math.max(boL, boH - math.max(0.6 * atr14, 0.5 * (boH - boL))) - slBuf * atr14
-            Trade c = f_cand(1, 2, retestC ? boH : close, raw, lv, retestC, sweepInLong, bullFvgNew, false)
-            if not na(c)
-                array.push(cands, c)
-            sqUsed := true
-        if cShort
-            float raw = math.min(boH, boL + math.max(0.6 * atr14, 0.5 * (boH - boL))) + slBuf * atr14
-            Trade c = f_cand(-1, 2, retestC ? boL : close, raw, lv, retestC, sweepInShort, bearFvgNew, false)
-            if not na(c)
-                array.push(cands, c)
-            sqUsed := true
-        if dLong
-            Trade c = f_cand(1, 3, close, low - slBuf * atr14, array.from(vw - sd, vw), false, sweepInLong, false, false)
-            if not na(c)
-                array.push(cands, c)
-        if dShort
-            Trade c = f_cand(-1, 3, close, high + slBuf * atr14, array.from(vw + sd, vw), false, sweepInShort, false, false)
-            if not na(c)
-                array.push(cands, c)
-
-    // ── d) Every candidate becomes a shadow trade (one open per setup+direction),
-    //       so the model learns from the full set, not only from what it displayed.
-    Trade best = na
-    for c in cands
-        nCandTotal += 1
-        evCandL := evCandL or c.dir == 1
-        evCandS := evCandS or c.dir == -1
-        c.qualified := c.p * 100 >= thr
-        bool dup = false
-        for s in shadows
-            if s.setup == c.setup and s.dir == c.dir
-                dup := true
-        if not dup and array.size(shadows) < 60
-            array.push(shadows, c.copy())
-        float need = thr + (c.sess == 3 ? nyPmExtra : 0)
-        bool counter = c.setup == 0 and biasSign == -c.dir
-        if counter
-            need := math.max(need, 85)
-        bool okC = c.p * 100 >= need and not array.get(setupOff, c.setup) and (not counter or c.pdSweep)
-        if okC and (na(best) or c.p > best.p)
-            best := c
-
     // ── e) Display gate: warm-up done, nothing open, no cooldown / daily stop.
-    bool canShow = na(cur) and closedShadows >= warmupN and dayLosses < maxDayLoss and (na(lastLossBar) or bar_index - lastLossBar > cooldownN)
+    bool canShow = na(cur) and closedShadows >= warmEff and dayLosses < maxDayLossEff and (na(lastLossBar) or bar_index - lastLossBar >= cooldownEff)
     if canShow and not na(best)
         cur := best.copy()
         f_draw(cur)
@@ -1389,7 +1432,7 @@ if showDash and barstate.islast
     int wS = -1
     float bE = na
     float wE = na
-    for s = 0 to 3
+    for s = 0 to 4
         float e = f_ringExp(s, 50)
         if array.get(ringCnt, s) >= 10 and not na(e)
             if na(bE) or e > bE
@@ -1401,7 +1444,7 @@ if showDash and barstate.islast
     // Best setup × session combination (min 10 qualified trades).
     string comboTxt = "—"
     float cBest = na
-    for s = 0 to 3
+    for s = 0 to 4
         for j = 0 to 5
             float n = matrix.get(comboN, s, j)
             if n >= 10
@@ -1424,7 +1467,7 @@ if showDash and barstate.islast
     f_row(12, "Best setup", bS >= 0 ? array.get(SETUPS, bS) + " (" + str.tostring(bE, "+0.00;-0.00") + "R)" : "—", cW)
     f_row(13, "Worst setup", wS >= 0 ? array.get(SETUPS, wS) + " (" + str.tostring(wE, "+0.00;-0.00") + "R)" + (array.get(setupOff, wS) ? " OFF" : "") : "—", cW)
     f_row(14, "Best combo", comboTxt, cW)
-    f_row(15, "Model", closedShadows < warmupN ? "Warming up (" + str.tostring(closedShadows) + "/" + str.tostring(warmupN) + ")" : "Active · " + str.tostring(closedShadows) + " trades learned", closedShadows < warmupN ? cGrey : cBuy)
+    f_row(15, "Model", closedShadows < warmEff ? "Warming up (" + str.tostring(closedShadows) + "/" + str.tostring(warmEff) + ")" : "Active · " + str.tostring(closedShadows) + " trades learned", closedShadows < warmEff ? cGrey : cBuy)
     f_row(16, supportedTF ? "Volume" : "Note", supportedTF ? (gcOk ? "COMEX GC futures" : "Chart tick volume") : "Optimised for 1m / 5m / 15m", supportedTF ? cW : cSell)
     // Diagnostics: shows what the engine is seeing, and why nothing is displayed.
     int hn = array.size(hScore)
@@ -1434,7 +1477,7 @@ if showDash and barstate.islast
         for i = 0 to hn - 1
             if array.get(hY, i) >= 1.0
                 shW += 1
-    string why = nCandTotal == 0 ? "No setups passed the filters" : closedShadows < warmupN ? "Warming up" : nTr == 0 and topScore < thr ? "Scores below threshold" : "Running"
+    string why = nCandTotal == 0 ? "No setups passed the filters" : closedShadows < warmEff ? "Warming up" : nTr == 0 and topScore < thr ? "Scores below threshold" : "Running"
     f_row(17, "Setups found", str.tostring(nCandTotal) + " · shadow WR " + (hn > 0 ? str.tostring(shW / hn * 100, "#") + "%" : "—"), cW)
     f_row(18, "Top score (last 100)", na(topScore) ? "—" : str.tostring(math.round(topScore)), cW)
     f_row(19, "Status", why, why == "Running" ? cBuy : cSell)
