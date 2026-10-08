@@ -106,6 +106,7 @@ color cSLLine = input.color(#F23645, "SL line", group = G_VIS)
 color cTPBox = input.color(color.new(#1B5E20, 60), "TP box", group = G_VIS)
 color cSLBox = input.color(color.new(#7F1D1D, 60), "SL box", group = G_VIS)
 bool showSLHit = input.bool(true, "Show SL / exit labels", group = G_VIS, tooltip = "Grey 'Long SL' / 'Short SL' / 'Exit' labels so losses are visible too.")
+bool showPrices = input.bool(true, "Price tags on the open trade", group = G_VIS, tooltip = "Shows the exact Entry, TP and SL prices at the right edge of the trade that is currently open. They disappear when the trade closes.")
 bool showTip = input.bool(true, "Score & RR tooltip on Buy/Sell", group = G_VIS, tooltip = "Hover a Buy/Sell label to see score, RR, setup and session.")
 bool showVwap = input.bool(false, "Show VWAP + σ bands", group = G_VIS)
 bool showLevels = input.bool(false, "Show PDH/PDL + prior POC/VAH/VAL", group = G_VIS)
@@ -171,6 +172,9 @@ type Trade
     line slLn = na
     line enLn = na
     line tp1Ln = na
+    label tpLbl = na
+    label slLbl = na
+    label enLbl = na
 
 // ─── PURE HELPERS ────────────────────────────────────────────────────────────────
 f_clamp(float v, float lo, float hi) =>
@@ -1111,6 +1115,10 @@ f_draw(Trade t) =>
     if useTP1
         float l1 = t.entry + t.dir * t.risk
         t.tp1Ln := line.new(x1, l1, x1 + 1, l1, color = color.new(cTPLine, 50), width = 1, style = line.style_dotted)
+    if showPrices
+        t.tpLbl := label.new(x1, t.tp, "TP " + str.tostring(t.tp, format.mintick), style = label.style_label_left, color = cTPLine, textcolor = color.white, size = size.small)
+        t.enLbl := label.new(x1, t.entry, (t.isLimit ? "Limit " : "Entry ") + str.tostring(t.entry, format.mintick) + "  RR 1:" + str.tostring(t.rr, "#.#"), style = label.style_label_left, color = cEntry, textcolor = color.white, size = size.small)
+        t.slLbl := label.new(x1, t.sl, "SL " + str.tostring(t.sl, format.mintick), style = label.style_label_left, color = cSLLine, textcolor = color.white, size = size.small)
     string tip = showTip ? "Score " + str.tostring(math.round(t.p * 100)) + " | RR 1:" + str.tostring(t.rr, "#.##") + " | " + array.get(SETUPS, t.setup) + " | " + array.get(SESS, t.sess) + (t.isLimit ? " | Limit @ " + str.tostring(t.entry, format.mintick) : "") + " | SL " + str.tostring(t.sl, format.mintick) + " | TP " + str.tostring(t.tp, format.mintick) : ""
     label.new(x1, lg ? low : high, lg ? "Buy" : "Sell", yloc = lg ? yloc.belowbar : yloc.abovebar, style = lg ? label.style_label_up : label.style_label_down, color = lg ? cBuy : cSell, textcolor = color.white, size = size.normal, tooltip = tip)
 
@@ -1122,6 +1130,10 @@ f_extend(Trade t) =>
     line.set_x2(t.enLn, bar_index)
     if not na(t.tp1Ln)
         line.set_x2(t.tp1Ln, bar_index)
+    if not na(t.tpLbl)
+        label.set_x(t.tpLbl, bar_index)
+        label.set_x(t.enLbl, bar_index)
+        label.set_x(t.slLbl, bar_index)
 
 f_json(Trade t, string ev) =>
     '{"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","event":"' + ev + '","side":"' + (t.dir == 1 ? "buy" : "sell") + '","entry":' + str.tostring(t.entry, format.mintick) + ',"sl":' + str.tostring(t.sl, format.mintick) + ',"tp":' + str.tostring(t.tp, format.mintick) + ',"rr":' + str.tostring(t.rr, "#.##") + ',"score":' + str.tostring(math.round(t.p * 100)) + ',"setup":"' + array.get(SETUPS, t.setup) + '","session":"' + array.get(SESS, t.sess) + '"}'
@@ -1198,6 +1210,7 @@ if barstate.isconfirmed
         f_extend(cur)
         if o == 6
             line.set_style(cur.enLn, line.style_solid)
+            label.set_text(cur.enLbl, "Entry " + str.tostring(cur.entry, format.mintick) + "  RR 1:" + str.tostring(cur.rr, "#.#"))
         bool lg = cur.dir == 1
         if cur.beMoved and o == 0 and inRange
             strategy.exit("Exit", from_entry = lg ? "Long" : "Short", stop = cur.entry, limit = cur.tp)
@@ -1240,6 +1253,9 @@ if barstate.isconfirmed
                 strategy.cancel(lg ? "Long" : "Short")
             else
                 strategy.close_all(comment = o == 4 ? "Timeout" : "Exit")
+            label.delete(cur.tpLbl)
+            label.delete(cur.enLbl)
+            label.delete(cur.slLbl)
             cur := na
 
     // ── c) Build this bar's candidates.
