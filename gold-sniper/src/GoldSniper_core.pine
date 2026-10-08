@@ -1,3 +1,4 @@
+// Gold Sniper [XAUUSD] · paste this WHOLE file into an EMPTY Pine Editor (delete everything first)
 //@version=6
 // ==== BEGIN IND
 indicator("Gold Sniper [XAUUSD]", "GoldSniper", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 1000)
