@@ -68,6 +68,19 @@ The order-flow score, trapped-trader flag, stacked-aggression flag and grade are
 
 On a **1m chart** there is only one 1-minute bar inside each candle, so the order-flow parts use body-based estimates. Order flow is most informative on **5m and 15m**.
 
+## Scalping timeframes (1–7 minutes)
+
+On 1m to 7m charts, the indicator favours **more signals** while keeping the win rate above 50%:
+
+| Setting | 1–7m (Frequent mode) | 8–15m |
+|---|---|---|
+| Target win rate the threshold tunes to | **55%** (*Target win rate on 1–7m charts*) | 70% |
+| Lowest threshold allowed | 35 | 40 |
+| Confluence pillars needed | **2 of 5** | 3 of 5 |
+| Order-flow veto below | 40 | 45 |
+
+With about 1:1 targets (*High win rate* style), a 55% win rate still makes money. The threshold only drops to a level where the last 300 setups actually met 55% with positive expectancy, so signals increase as far as the data allows and no further. Presets cover every minute timeframe: 1–2m use the 1m settings, 3–7m the 5m settings, and 8–15m the 15m settings.
+
 ## Target style (Setups → Target style)
 
 | Style | Targets | Effect |

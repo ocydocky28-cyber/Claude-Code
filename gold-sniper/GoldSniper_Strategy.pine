@@ -79,6 +79,8 @@ int toDate = input.time(timestamp("2099-01-01T00:00:00+00:00"), "Backtest to", g
 
 string G_ML = "Learning engine"
 bool adaptive = input.bool(true, "Adaptive threshold", group = G_ML, tooltip = "Every 20 closed shadow trades, picks the lowest score threshold whose recent win rate meets the target with positive expectancy.")
+float lowTfWR = input.float(55, "Target win rate on 1–7m charts %", minval = 40, maxval = 90, group = G_ML, tooltip = "Scalping timeframes (1 to 7 minutes) use this target instead, so signals come more often while staying above 50%. With ~1:1 targets, 55% keeps expectancy positive.")
+int lowTfPillars = input.int(2, "Min confluence pillars on 1–7m (Frequent)", minval = 1, maxval = 5, group = G_ML, tooltip = "In Frequent mode on 1–7m charts, trades need only this many of the 5 pillars. The adaptive threshold still has to meet the 1–7m target win rate.")
 float targetWR = input.float(70, "Target win rate %", minval = 40, maxval = 90, group = G_ML, tooltip = "The win rate the adaptive threshold aims for. Higher = fewer, more selective signals.")
 int thrMin = input.int(40, "Threshold floor", minval = 20, maxval = 90, group = G_ML, tooltip = "The adaptive threshold never goes below this. The score is a calibrated win probability, so for 1.5R+ gold trades most scores sit between 35 and 65; the floor must be low enough for the tuner to find the score level where the measured win rate meets your target.")
 int thrMax = input.int(90, "Threshold ceiling", minval = 50, maxval = 99, group = G_ML, tooltip = "The adaptive threshold never goes above this.")
@@ -127,10 +129,12 @@ bool showAll = input.bool(false, "Show every detected setup (grey dots)", group 
 // Gold behaves differently on each timeframe: 1m needs a wider stop buffer and a
 // stricter score, 15m can aim for bigger RR. These presets load automatically.
 int tfSec = timeframe.in_seconds()
-bool is1 = tfSec == 60
-bool is5 = tfSec == 300
-bool is15 = tfSec == 900
+// Preset bands: 1–2m use the 1m preset, 3–7m the 5m preset, 8–15m the 15m preset.
+bool is1 = tfSec >= 60 and tfSec <= 120
+bool is5 = tfSec > 120 and tfSec <= 420
+bool is15 = tfSec > 420 and tfSec <= 900
 bool supportedTF = is1 or is5 or is15
+bool lowTF = tfSec >= 60 and tfSec <= 420
 bool usePreset = autoPreset and supportedTF
 int pivLen = usePreset ? (is1 ? 3 : is5 ? 4 : 5) : mPiv
 bool styleHW = tpStyle == "High win rate"
@@ -147,7 +151,9 @@ float stFactor = is1 ? 2.0 : is5 ? 2.5 : 3.0
 int warmEff = modeF ? math.min(warmupN, 10) : warmupN
 int cooldownEff = modeF ? 0 : cooldownN
 int maxDayLossEff = modeF ? math.max(maxDayLoss, 6) : maxDayLoss
-int thrMinEff = modeS ? math.max(thrMin, 60) : thrMin
+int thrMinEff = modeS ? math.max(thrMin, 60) : lowTF ? math.min(thrMin, 35) : thrMin
+float targetWREff = lowTF and not modeS ? math.min(targetWR, lowTfWR) : targetWR
+int ofMinEff = lowTF and modeF ? math.min(ofMin, 40) : ofMin
 int maxBars = usePreset ? (is1 ? 60 : is5 ? 48 : 32) : mMaxBars
 
 // Higher timeframes used for the bias on each chart timeframe.
@@ -1011,7 +1017,7 @@ f_regimeFit(int setup) =>
     setup == 1 ? trending : setup == 2 ? atrPctPrev < 40 : setup == 3 ? meanRev : setup == 4 ? (trending or er > 0.25) : true
 f_gradeTxt(int g) =>
     g >= 5 ? "A+" : g == 4 ? "A" : g == 3 ? "B" : "C"
-int minPillarsEff = modeS ? math.max(minPillars, 4) : minPillars
+int minPillarsEff = modeS ? math.max(minPillars, 4) : lowTF and modeF ? math.min(minPillars, lowTfPillars) : minPillars
 
 // ═══ 7. STOP LOSS / TAKE PROFIT ═════════════════════════════════════════════════
 // Stops go behind structure; targets go to the next REAL level (liquidity, VWAP
@@ -1120,7 +1126,7 @@ f_cand(int dir, int setup, float entry, float rawSL, array<float> lv, bool isLim
     float sl = f_finalSL(dir, entry, rawSL)
     float ofS = dir == 1 ? ofLong : ofShort
     int grade = (biasSign == dir ? 1 : 0) + ((dir == 1 ? locLong : locShort) ? 1 : 0) + 1 + (ofS >= 60 ? 1 : 0) + (f_regimeFit(setup) ? 1 : 0)
-    if not na(sl) and not na(entry) and (not ofGate or ofS >= ofMin)
+    if not na(sl) and not na(entry) and (not ofGate or ofS >= ofMinEff)
         float risk = (entry - sl) * dir
         float tp = f_pickTP(dir, entry, risk, lv)
         if not na(tp)
@@ -1216,7 +1222,7 @@ f_retune(float cur) =>
                             w += 1
                 if c >= 10 and sr > 0
                     float wr = w / c * 100
-                    if wr >= targetWR
+                    if wr >= targetWREff
                         res := T
                         found := true
                     else if wr > bestWR
@@ -1536,7 +1542,7 @@ if showDash and barstate.islast
     f_row(4, "ADR used", str.tostring(math.round(adrUsed * 100)) + "%", adrUsed > 0.85 ? cSell : cW)
     f_row(5, "Threshold", str.tostring(math.round(thr)) + (adaptive ? " (adaptive)" : ""), cW)
     f_row(6, "Trades", str.tostring(nTr, "#") + "  W " + str.tostring(nWin, "#") + " / L " + str.tostring(nLoss, "#") + " / S " + str.tostring(nScr, "#"), cW)
-    f_row(7, "Win rate", na(wr) ? "—" : str.tostring(wr, "#.0") + "%", na(wr) ? cW : wr >= targetWR ? cBuy : cSell)
+    f_row(7, "Win rate", na(wr) ? "—" : str.tostring(wr, "#.0") + "%", na(wr) ? cW : wr >= targetWREff ? cBuy : cSell)
     f_row(8, "Avg planned RR", nTr > 0 ? "1:" + str.tostring(sumRR / nTr, "#.00") : "—", cW)
     f_row(9, "Profit factor", na(pf) ? "—" : str.tostring(pf, "#.00"), na(pf) ? cW : pf >= 1 ? cBuy : cSell)
     f_row(10, "Expectancy", na(ex) ? "—" : str.tostring(ex, "+0.00;-0.00") + "R", na(ex) ? cW : ex >= 0 ? cBuy : cSell)
@@ -1545,7 +1551,7 @@ if showDash and barstate.islast
     f_row(13, "Worst setup", wS >= 0 ? array.get(SETUPS, wS) + " (" + str.tostring(wE, "+0.00;-0.00") + "R)" + (array.get(setupOff, wS) ? " OFF" : "") : "—", cW)
     f_row(14, "Best combo", comboTxt, cW)
     f_row(15, "Model", closedShadows < warmEff ? "Warming up (" + str.tostring(closedShadows) + "/" + str.tostring(warmEff) + ")" : "Active · " + str.tostring(closedShadows) + " trades learned", closedShadows < warmEff ? cGrey : cBuy)
-    f_row(16, supportedTF ? "Volume" : "Note", supportedTF ? (gcOk ? "COMEX GC futures" : "Chart tick volume") : "Optimised for 1m / 5m / 15m", supportedTF ? cW : cSell)
+    f_row(16, supportedTF ? "Volume" : "Note", supportedTF ? (gcOk ? "COMEX GC futures" : "Chart tick volume") : "Optimised for 1m – 15m", supportedTF ? cW : cSell)
     // Diagnostics: shows what the engine is seeing, and why nothing is displayed.
     int hn = array.size(hScore)
     float topScore = hn > 0 ? array.max(hScore) : na
