@@ -71,8 +71,8 @@ bool pdFilter = input.bool(true, "Premium / discount filter", group = G_RISK, to
 bool mtfConf = input.bool(true, "MTF confluence on 1m", group = G_RISK, tooltip = "On the 1m chart, only show signals the 5m and 15m structure agrees with. Cuts a lot of 1m noise.")
 // ==== BEGIN STRAT
 float riskPct = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.1, group = G_RISK, tooltip = "Position size is set so that hitting the stop loses this % of equity.")
-int fromDate = input.time(timestamp("UTC", 2020, 1, 1, 0, 0), "Backtest from", group = G_RISK, tooltip = "Start of the backtest window. Use it for walk-forward testing: tune on one period, then check the next period without changing settings.")
-int toDate = input.time(timestamp("UTC", 2099, 1, 1, 0, 0), "Backtest to", group = G_RISK, tooltip = "End of the backtest window.")
+int fromDate = input.time(timestamp("2020-01-01T00:00:00+00:00"), "Backtest from", group = G_RISK, tooltip = "Start of the backtest window. Use it for walk-forward testing: tune on one period, then check the next period without changing settings.")
+int toDate = input.time(timestamp("2099-01-01T00:00:00+00:00"), "Backtest to", group = G_RISK, tooltip = "End of the backtest window.")
 // ==== END STRAT
 
 string G_ML = "Learning engine"
@@ -92,11 +92,11 @@ int nyPmExtra = input.int(5, "NY PM extra score required", minval = 0, maxval = 
 bool nfpAuto = input.bool(true, "Auto blackout: NFP (1st Friday 08:30)", group = G_SES, tooltip = "No new signals around US Non-Farm Payrolls.")
 int newsBefore = input.int(15, "Blackout minutes before news", minval = 0, maxval = 240, group = G_SES, tooltip = "Minutes before each news time with no new signals.")
 int newsAfter = input.int(30, "Blackout minutes after news", minval = 0, maxval = 240, group = G_SES, tooltip = "Minutes after each news time with no new signals.")
-int news1 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 1", group = G_SES, tooltip = "Pine can't read an economic calendar. Enter high-impact news times here (CPI, FOMC, PCE…). Leave at 2000-01-01 to disable.")
-int news2 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 2", group = G_SES, tooltip = "Second news time. Leave at 2000-01-01 to disable.")
-int news3 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 3", group = G_SES, tooltip = "Third news time. Leave at 2000-01-01 to disable.")
-int news4 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 4", group = G_SES, tooltip = "Fourth news time. Leave at 2000-01-01 to disable.")
-int news5 = input.time(timestamp("UTC", 2000, 1, 1, 0, 0), "News time 5", group = G_SES, tooltip = "Fifth news time. Leave at 2000-01-01 to disable.")
+int news1 = input.time(timestamp("2000-01-01T00:00:00+00:00"), "News time 1", group = G_SES, tooltip = "Pine can't read an economic calendar. Enter high-impact news times here (CPI, FOMC, PCE…). Leave at 2000-01-01 to disable.")
+int news2 = input.time(timestamp("2000-01-01T00:00:00+00:00"), "News time 2", group = G_SES, tooltip = "Second news time. Leave at 2000-01-01 to disable.")
+int news3 = input.time(timestamp("2000-01-01T00:00:00+00:00"), "News time 3", group = G_SES, tooltip = "Third news time. Leave at 2000-01-01 to disable.")
+int news4 = input.time(timestamp("2000-01-01T00:00:00+00:00"), "News time 4", group = G_SES, tooltip = "Fourth news time. Leave at 2000-01-01 to disable.")
+int news5 = input.time(timestamp("2000-01-01T00:00:00+00:00"), "News time 5", group = G_SES, tooltip = "Fifth news time. Leave at 2000-01-01 to disable.")
 
 string G_VOL = "Volume"
 string volSrc = input.string("COMEX:GC1!", "Volume source", options = ["COMEX:GC1!", "Chart"], group = G_VOL, tooltip = "Spot XAUUSD only has broker tick volume. COMEX:GC1! pulls real gold futures volume for relative-volume and absorption, falling back to chart volume on bars where futures data isn't available. VWAP, delta and the volume profile always use chart volume so they stay consistent.")
@@ -391,7 +391,7 @@ if lonEnd
 
 // News blackout: manual times + automatic NFP (first Friday, 08:30 NY).
 f_inNews(int t) =>
-    t > timestamp("UTC", 2001, 1, 1, 0, 0) and time_close > t - newsBefore * 60000 and time < t + newsAfter * 60000
+    t > timestamp("2001-01-01T00:00:00+00:00") and time_close > t - newsBefore * 60000 and time < t + newsAfter * 60000
 bool nfpNow = nfpAuto and dayofweek(time, "America/New_York") == dayofweek.friday and dayofmonth(time, "America/New_York") <= 7 and tod >= 510 - newsBefore and tod < 510 + newsAfter
 bool blackout = nfpNow or f_inNews(news1) or f_inNews(news2) or f_inNews(news3) or f_inNews(news4) or f_inNews(news5)
 bool sessAllowed = sessId == 0 ? allowAsia : sessId == 4 ? allowOther : sessId == 5 ? not blockDead : true
@@ -456,8 +456,12 @@ cvd := newDay ? ibDelta : cvd + ibDelta
 bool absorb = rvol >= 1.5 and rng > 0 and body < 0.3 * rng
 
 // Delta divergence: new price extreme without a new CVD extreme = exhaustion.
-bool bearDDiv = high >= ta.highest(high, 20) and cvd < ta.highest(cvd, 20)[1]
-bool bullDDiv = low <= ta.lowest(low, 20) and cvd > ta.lowest(cvd, 20)[1]
+float hh20 = ta.highest(high, 20)
+float ll20 = ta.lowest(low, 20)
+float cvdHiPrev = ta.highest(cvd, 20)[1]
+float cvdLoPrev = ta.lowest(cvd, 20)[1]
+bool bearDDiv = high >= hh20 and cvd < cvdHiPrev
+bool bullDDiv = low <= ll20 and cvd > cvdLoPrev
 bool bearDDivRecent = nz(ta.barssince(bearDDiv), 999) <= 3
 bool bullDDivRecent = nz(ta.barssince(bullDDiv), 999) <= 3
 
@@ -781,7 +785,9 @@ if bar_index > 110 and bar_index % 5 == 0
 
 bool trending = er > 0.35 or (hurst > 0.55 and er >= 0.2)
 bool meanRev = not trending and (er < 0.2 or hurst < 0.45)
-float lrSlope = atr14 > 0 ? (ta.linreg(close, 50, 0) - ta.linreg(close, 50, 1)) / atr14 : 0.0
+float lr0 = ta.linreg(close, 50, 0)
+float lr1 = ta.linreg(close, 50, 1)
+float lrSlope = atr14 > 0 ? (lr0 - lr1) / atr14 : 0.0
 
 // Bollinger-inside-Keltner squeeze and its range.
 float bbBasis = ta.sma(close, 20)
