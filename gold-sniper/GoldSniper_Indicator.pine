@@ -1,5 +1,5 @@
 //@version=6
-indicator("Gold Sniper [XAUUSD]", "Gold Sniper", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 1000)
+indicator("Gold Sniper [XAUUSD]", "GoldSniper", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 1000)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  GOLD SNIPER  ·  XAUUSD / COMEX GC intraday signal engine for 1m · 5m · 15m
