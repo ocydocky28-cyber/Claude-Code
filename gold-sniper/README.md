@@ -81,6 +81,19 @@ On 1m to 7m charts, the indicator favours **more signals** while keeping the win
 
 With about 1:1 targets (*High win rate* style), a 55% win rate still makes money. The threshold only drops to a level where the last 300 setups actually met 55% with positive expectancy, so signals increase as far as the data allows and no further. Presets cover every minute timeframe: 1–2m use the 1m settings, 3–7m the 5m settings, and 8–15m the 15m settings.
 
+## Daily minimum of high-probability trades
+
+| Chart | Every signal needs | Daily minimum |
+|---|---|---|
+| 1–2m | Score ≥ 60 (an estimated 60%+ chance of hitting TP) | **2** high-probability trades |
+| 3–7m | Score ≥ 60 | **1** high-probability trade |
+| 8–15m | The adaptive threshold | none |
+
+- **How the minimum works:** until today's minimum is reached, the stricter adaptive threshold steps aside. The best setup that scores **≥ 60**, grades **B or better** (3+ of 5 pillars) and has **order flow ≥ 55** is shown.
+- **No forced trades:** if no setup that good appears, nothing is forced. A trade without a real edge would only lower the win rate.
+- **Reasons:** hover the **Buy/Sell** label to see why the trade was taken: setup, daily bias, key level, liquidity sweep, order-flow score, trapped traders, absorption, stacked buying/selling, regime fit and the grade.
+- **Calibration row:** the dashboard shows how often setups scoring ≥ 60 actually hit TP on your chart. Green means the 60% estimate is holding. Red means it isn't, so raise the score floor.
+
 ## Target style (Setups → Target style)
 
 | Style | Targets | Effect |
