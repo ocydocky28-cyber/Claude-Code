@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remezzo Assistant</title>
+  <style>
+    :root {
+      --bg: #faf6f1;
+      --surface: #ffffff;
+      --text: #2b2420;
+      --muted: #7a6e66;
+      --accent: #b3261e;
+      --accent-text: #ffffff;
+      --bot-bubble: #f1ebe4;
+      --border: #e5ddd4;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1a1614;
+        --surface: #24201d;
+        --text: #f1ebe4;
+        --muted: #a8998e;
+        --accent: #e0564c;
+        --accent-text: #ffffff;
+        --bot-bubble: #2f2a26;
+        --border: #3a332e;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100dvh;
+      display: flex;
+      justify-content: center;
+    }
+    .app {
+      width: 100%;
+      max-width: 720px;
+      display: flex;
+      flex-direction: column;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      border-right: 1px solid var(--border);
+    }
+    header {
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { margin: 0; font-size: 1.25rem; }
+    header h1 span { color: var(--accent); }
+    header p { margin: 4px 0 0; color: var(--muted); font-size: 0.875rem; }
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .msg {
+      max-width: 85%;
+      padding: 10px 14px;
+      border-radius: 16px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: var(--accent-text);
+      border-bottom-right-radius: 4px;
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: var(--bot-bubble);
+      border-bottom-left-radius: 4px;
+    }
+    .msg.error { color: var(--accent); }
+    .msg.typing::after { content: "…"; animation: blink 1s infinite; }
+    @keyframes blink { 50% { opacity: 0.3; } }
+    #suggestions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0 16px 12px;
+    }
+    #suggestions[hidden] { display: none; }
+    #suggestions button {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    #suggestions button:hover { border-color: var(--accent); }
+    form {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px 16px;
+      border-top: 1px solid var(--border);
+    }
+    input {
+      flex: 1;
+      min-width: 0;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 1rem;
+    }
+    input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    button[type="submit"] {
+      padding: 0 18px;
+      border: 0;
+      border-radius: 12px;
+      background: var(--accent);
+      color: var(--accent-text);
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1><span>Remezzo</span> Assistant</h1>
+      <p>Pizza &amp; modern Italian · 568 North Rd, Ormond · (03) 9578 8576</p>
+    </header>
+    <div id="messages" aria-live="polite"></div>
+    <div id="suggestions">
+      <button type="button">What's popular on the menu?</button>
+      <button type="button">Do you have vegan options?</button>
+      <button type="button">How do I book a table?</button>
+      <button type="button">Can I order takeaway online?</button>
+    </div>
+    <form id="chat-form">
+      <input id="input" type="text" placeholder="Ask about the menu, bookings, location…" autocomplete="off" maxlength="2000" required>
+      <button type="submit">Send</button>
+    </form>
+  </div>
+
+  <script>
+    const messagesEl = document.getElementById("messages");
+    const form = document.getElementById("chat-form");
+    const input = document.getElementById("input");
+    const sendBtn = form.querySelector("button[type=submit]");
+    const suggestions = document.getElementById("suggestions");
+    const history = [];
+
+    function addBubble(role, text) {
+      const el = document.createElement("div");
+      el.className = `msg ${role}`;
+      el.textContent = text;
+      messagesEl.appendChild(el);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return el;
+    }
+
+    // Strip markdown emphasis markers so replies read cleanly as plain text.
+    const tidy = (text) => text.replace(/\*\*(.+?)\*\*/g, "$1");
+
+    addBubble("assistant", "Ciao! I'm Remezzo's assistant. Ask me about our menu, dietary options, bookings, takeaway or how to find us.");
+
+    async function ask(question) {
+      suggestions.hidden = true;
+      addBubble("user", question);
+      history.push({ role: "user", content: question });
+      input.value = "";
+      input.disabled = sendBtn.disabled = true;
+
+      const bubble = addBubble("assistant typing", "");
+      let reply = "";
+      let failed = false;
+
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: history }),
+        });
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split("\n\n");
+          buffer = events.pop();
+          for (const raw of events) {
+            const type = raw.match(/^event: (.*)$/m)?.[1];
+            const data = JSON.parse(raw.match(/^data: (.*)$/m)?.[1] || "{}");
+            if (type === "delta") {
+              reply += data.text;
+              bubble.classList.remove("typing");
+              bubble.textContent = tidy(reply);
+              messagesEl.scrollTop = messagesEl.scrollHeight;
+            } else if (type === "error") {
+              failed = true;
+              reply = data.message;
+            }
+          }
+        }
+      } catch {
+        failed = true;
+        reply = "Sorry, I couldn't connect. Please try again, or call us on (03) 9578 8576.";
+      }
+
+      bubble.classList.remove("typing");
+      bubble.textContent = tidy(reply);
+      if (failed) {
+        bubble.classList.add("error");
+        history.pop(); // drop the unanswered question so the conversation stays valid
+      } else {
+        history.push({ role: "assistant", content: reply });
+      }
+      input.disabled = sendBtn.disabled = false;
+      input.focus();
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const q = input.value.trim();
+      if (q) ask(q);
+    });
+    suggestions.addEventListener("click", (e) => {
+      if (e.target.tagName === "BUTTON") ask(e.target.textContent);
+    });
+  </script>
+</body>
+</html>

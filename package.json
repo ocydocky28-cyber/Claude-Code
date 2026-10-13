@@ -1,0 +1,16 @@
+{
+  "name": "remezzo-chatbot",
+  "version": "1.0.0",
+  "description": "AI chat assistant that answers questions about Remezzo, Ormond VIC",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0"
+  }
+}
